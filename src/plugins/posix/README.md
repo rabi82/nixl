@@ -22,15 +22,19 @@ Optionally POSIX plugin can also use liburing.
 
 ## I/O Backends
 
-Select at most one backend flag; `use_aio`, `use_uring`, and `use_posix_aio` are
-mutually exclusive. With no flag selected, the plugin uses Linux AIO when it was
-built; otherwise it falls back to io_uring, then POSIX AIO.
+`use_aio`, `use_uring`, and `use_posix_aio` are boolean parameters and are
+mutually exclusive. To explicitly select a backend, set exactly one parameter to
+`"true"`; otherwise leave all parameters unset or `"false"`. With no backend
+selected, the plugin chooses one default at build time from the compiled-in
+`HAVE_*` options: Linux AIO, then io_uring, then POSIX AIO. This is a build-time
+selection, not a runtime fallback or retry.
 
-- **Linux AIO** (`use_aio`, default when available): use for the standard `libaio` path.
-- **io_uring** (`use_uring`): use where `liburing` and io_uring syscalls are available;
-  Docker deployments also need the seccomp allowance described below.
-- **POSIX AIO** (`use_posix_aio`, deprecated): use only for legacy deployments; prefer
-  Linux AIO or io_uring for new deployments.
+- **Linux AIO** (`use_aio`): default when built with `libaio`; requires `libaio`.
+- **io_uring** (`use_uring`): requires `liburing` and permitted io_uring syscalls;
+  Docker deployments also need the [seccomp allowance](#running-liburing-with-docker).
+- **POSIX AIO** (`use_posix_aio`): legacy-only. Its deprecated status is
+  documentation/project policy; the backend code does not enforce it. Prefer Linux
+  AIO or io_uring for new deployments.
 
 ## File registration
 
