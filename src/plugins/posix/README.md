@@ -20,8 +20,17 @@ limitations under the License.
 This backend provides POSIX-compliant I/O operations using either Linux AIO (libaio) by default
 Optionally POSIX plugin can also use liburing.
 
-**POSIX AIO (`use_posix_aio`) is deprecated.** Use Linux AIO (`use_aio`) or io_uring
-(`use_uring`) for new deployments.
+## I/O Backends
+
+Select at most one backend flag; `use_aio`, `use_uring`, and `use_posix_aio` are
+mutually exclusive. With no flag selected, the plugin uses Linux AIO when it was
+built; otherwise it falls back to io_uring, then POSIX AIO.
+
+- **Linux AIO** (`use_aio`, default when available): use for the standard `libaio` path.
+- **io_uring** (`use_uring`): use where `liburing` and io_uring syscalls are available;
+  Docker deployments also need the seccomp allowance described below.
+- **POSIX AIO** (`use_posix_aio`, deprecated): use only for legacy deployments; prefer
+  Linux AIO or io_uring for new deployments.
 
 ## File registration
 
