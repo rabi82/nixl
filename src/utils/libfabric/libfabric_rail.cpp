@@ -636,7 +636,10 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
         {
             struct fi_eq_attr eq_attr = {};
             eq_attr.wait_obj = FI_WAIT_NONE;
-            ret = fi_eq_open(fabric, &eq_attr, &eq, NULL);
+            // fi_eq_open() calls the fabric's eq_open op without a null check.
+            ret = (fabric->ops && fabric->ops->eq_open) ?
+                fi_eq_open(fabric, &eq_attr, &eq, NULL) :
+                -FI_ENOSYS;
             if (ret == 0) {
                 ret = fi_ep_bind(endpoint, &eq->fid, 0);
                 if (ret) {
