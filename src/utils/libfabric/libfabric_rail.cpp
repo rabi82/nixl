@@ -493,6 +493,7 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
         hints->domain_attr->threading = completion_model ? FI_THREAD_COMPLETION : FI_THREAD_DOMAIN;
         thread_domain_ = !completion_model;
     }
+    stats_enabled_ = getenv("NIXL_LIBFABRIC_STATS") != nullptr;
 
     // The EFA provider accepts FI_MR_DMABUF from libfabric API 1.20 on, so request 1.20
     // where the library provides it and 1.18 elsewhere. The fabric carries the requested
@@ -745,6 +746,9 @@ nixlLibfabricRail::isProperlyInitialized() const {
 
 void
 nixlLibfabricRail::cleanup() {
+    if (stats_enabled_ && stats_.reap_calls.load() > 0) {
+        printStats();
+    }
     NIXL_TRACE << "Starting cleanup for rail " << rail_id;
 
     // STEP 1: Close endpoint first to stop any new operations
@@ -860,6 +864,9 @@ nixlLibfabricRail::reapCompletions(nixl_status_t &first_error) {
         }
     }
     // CQ lock released here - completion is now local data
+    if (stats_enabled_) {
+        statsOnReap(ret > 0 ? ret : 0);
+    }
 
     if (ret == -FI_EAGAIN) {
         return 0;
@@ -1442,6 +1449,9 @@ nixlLibfabricRail::drainPostQueue() {
             if (ret != -FI_EAGAIN) {
                 break;
             }
+            if (stats_enabled_) {
+                stats_.eagain.fetch_add(1, std::memory_order_relaxed);
+            }
             ep_lock.unlock();
             pollForCompletions();
         }
@@ -1458,13 +1468,52 @@ nixlLibfabricRail::drainPostQueue() {
             releaseRequest(req);
             continue;
         }
+        if (stats_enabled_) {
+            stats_.posted.fetch_add(1, std::memory_order_relaxed);
+        }
         if (++posts_under_lock == POST_POLL_INTERLEAVE_RATIO) {
             ep_lock.unlock();
             pollForCompletions();
         }
     }
 
+    if (stats_enabled_ && post_req_count > 0) {
+        stats_.drain_calls.fetch_add(1, std::memory_order_relaxed);
+        stats_.drain_posts.fetch_add(post_req_count, std::memory_order_relaxed);
+    }
     return NIXL_SUCCESS;
+}
+
+void
+nixlLibfabricRail::statsOnReap(int n) const {
+    stats_.reap_calls.fetch_add(1, std::memory_order_relaxed);
+    if (n == 0) {
+        stats_.empty_reaps.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const uint64_t reaped = stats_.reaped.fetch_add(n, std::memory_order_relaxed);
+    const uint64_t posted = stats_.posted.load(std::memory_order_relaxed);
+    const uint64_t inflight = posted > reaped ? posted - reaped : 0;
+    stats_.inflight_sum.fetch_add(inflight, std::memory_order_relaxed);
+    if (inflight > stats_.inflight_max.load(std::memory_order_relaxed)) {
+        stats_.inflight_max.store(inflight, std::memory_order_relaxed);
+    }
+}
+
+void
+nixlLibfabricRail::printStats() const {
+    const uint64_t calls = stats_.reap_calls.load();
+    const uint64_t empty = stats_.empty_reaps.load();
+    const uint64_t full = calls > empty ? calls - empty : 0;
+    const uint64_t drains = stats_.drain_calls.load();
+    NIXL_INFO << "LFSTATS rail " << rail_id << " dev " << device_name
+              << " posted=" << stats_.posted.load() << " eagain=" << stats_.eagain.load()
+              << " reaped=" << stats_.reaped.load() << " reap_calls=" << calls
+              << " empty=" << empty
+              << " per_reap=" << (full ? stats_.reaped.load() / full : 0)
+              << " inflight_avg=" << (full ? stats_.inflight_sum.load() / full : 0)
+              << " inflight_max=" << stats_.inflight_max.load()
+              << " posts_per_drain=" << (drains ? stats_.drain_posts.load() / drains : 0);
 }
 
 nixl_status_t

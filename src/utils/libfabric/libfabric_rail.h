@@ -690,6 +690,26 @@ private:
     // Whether a progress thread is handling CQ draining
     bool progress_thread_enabled_ = false;
 
+    // Data-path counters, kept only when NIXL_LIBFABRIC_STATS is set; printed at cleanup.
+    struct alignas(64) RailStats {
+        std::atomic<uint64_t> posted{0}; // data posts accepted by the provider
+        std::atomic<uint64_t> eagain{0}; // data posts that returned -FI_EAGAIN
+        std::atomic<uint64_t> reaped{0}; // CQ entries read
+        std::atomic<uint64_t> reap_calls{0}; // fi_cq_readfrom calls
+        std::atomic<uint64_t> empty_reaps{0}; // calls that returned nothing
+        std::atomic<uint64_t> inflight_sum{0}; // posted - reaped, summed at each non-empty reap
+        std::atomic<uint64_t> inflight_max{0};
+        std::atomic<uint64_t> drain_calls{0}; // drainPostQueue calls that posted something
+        std::atomic<uint64_t> drain_posts{0};
+    };
+    bool stats_enabled_ = false;
+    mutable RailStats stats_;
+
+    void
+    statsOnReap(int n) const;
+    void
+    printStats() const;
+
     // Callback functions. Receive completions carry the sender's index in OUR table,
     // resolved from the completion's source address (see resolveSourceAddress()).
     std::function<void(const std::string &, uint32_t)> notificationCallback;
