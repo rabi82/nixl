@@ -639,7 +639,10 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
 
         if (provider_name == "efa") {
             // Disable unsolicited write recv for EFA RDM to reduce CQ overflow likelihood
-            const bool use_unsolicited_write_recv = false; // Set to false to disable the feature
+            // NIXL_LIBFABRIC_UNSOLICITED_WRITE_RECV=1 keeps the provider's default (on in
+            // libfabric >= 2.5). Only safe when NIXL is built against libfabric >= 2.5 headers.
+            const char *uwr_env = getenv("NIXL_LIBFABRIC_UNSOLICITED_WRITE_RECV");
+            const bool use_unsolicited_write_recv = uwr_env && std::string(uwr_env) == "1";
             ret = fi_setopt(&endpoint->fid,
                             FI_OPT_ENDPOINT,
                             NIXL_OPT_EFA_USE_UNSOLICITED_WRITE_RECV,
