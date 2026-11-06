@@ -208,6 +208,9 @@ private:
     // Progress thread delay in microseconds
     std::chrono::microseconds progress_thread_delay_;
 
+    // Data writes carry no remote CQ data; WRITE notifications go out after completion.
+    const bool write_no_imm_;
+
     // Rail Manager - Stack allocated for better performance (mutable for const methods)
     mutable nixlLibfabricRailManager rail_manager_;
 

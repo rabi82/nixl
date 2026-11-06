@@ -494,6 +494,17 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
         thread_domain_ = !completion_model;
     }
     stats_enabled_ = getenv("NIXL_LIBFABRIC_STATS") != nullptr;
+    // NIXL_LIBFABRIC_WRITE_NO_IMM=1: data writes carry no remote CQ data, so the target
+    // posts no receive per write; the initiator sends the notification once its writes
+    // complete (as for READ). NIXL_LIBFABRIC_WRITE_DC=1 also asks for delivery complete.
+    {
+        const char *e = getenv("NIXL_LIBFABRIC_WRITE_NO_IMM");
+        const char *dc = getenv("NIXL_LIBFABRIC_WRITE_DC");
+        write_flags_ = (e && std::string(e) == "1") ? 0 : FI_REMOTE_CQ_DATA;
+        if (dc && std::string(dc) == "1") {
+            write_flags_ |= FI_DELIVERY_COMPLETE;
+        }
+    }
 
     // The EFA provider accepts FI_MR_DMABUF from libfabric API 1.20 on, so request 1.20
     // where the library provides it and 1.18 elsewhere. The fabric carries the requested
@@ -1445,7 +1456,7 @@ nixlLibfabricRail::drainPostQueue() {
                 posts_under_lock = 0;
             }
             if (pr.type == nixlLibfabricPostRequest::WRITE) {
-                ret = fi_writemsg(endpoint, &msg, pr.fi_flags | FI_REMOTE_CQ_DATA);
+                ret = fi_writemsg(endpoint, &msg, pr.fi_flags | write_flags_);
             } else {
                 ret = fi_readmsg(endpoint, &msg, pr.fi_flags);
             }
@@ -1568,7 +1579,7 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
         // Libfabric fi_writemsg call (supports FI_MORE flag)
         {
             const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
-            ret = fi_writemsg(endpoint, &msg, fi_flags | FI_REMOTE_CQ_DATA);
+            ret = fi_writemsg(endpoint, &msg, fi_flags | write_flags_);
         }
 
         if (ret == 0) {

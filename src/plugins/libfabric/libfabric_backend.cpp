@@ -489,6 +489,10 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
     : nixlBackendEngine(init_params),
       progress_thread_enabled_(init_params->enableProgTh),
       progress_thread_delay_(std::chrono::microseconds(init_params->pthrDelay)),
+      write_no_imm_([] {
+          const char *e = getenv("NIXL_LIBFABRIC_WRITE_NO_IMM");
+          return e && std::string(e) == "1";
+      }()),
       rail_manager_(NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD),
       post_thread_count_(NIXL_LIBFABRIC_DEFAULT_POST_THREADS),
       post_split_batch_size_(NIXL_LIBFABRIC_DEFAULT_POST_SPLIT_BATCH_SIZE),
@@ -1684,7 +1688,8 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
     }
 
     // Send notification immediately after successful request submission
-    if (backend_handle->has_notif && backend_handle->operation_ == nixl_xfer_op_t::NIXL_WRITE) {
+    if (backend_handle->has_notif && backend_handle->operation_ == nixl_xfer_op_t::NIXL_WRITE &&
+        !write_no_imm_) {
         nixl_status_t notif_status = notifSendPriv(remote_agent,
                                                    backend_handle->binary_notifs,
                                                    backend_handle->total_notif_msg_len,
@@ -1709,7 +1714,8 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
 
     // For very small transfers we can check for local completions immediately.
     if (backend_handle->is_completed()) {
-        if (backend_handle->has_notif && backend_handle->operation_ == nixl_xfer_op_t::NIXL_READ) {
+        if (backend_handle->has_notif &&
+            (backend_handle->operation_ == nixl_xfer_op_t::NIXL_READ || write_no_imm_)) {
             nixl_status_t notif_status = notifSendPriv(remote_agent,
                                                        backend_handle->binary_notifs,
                                                        backend_handle->total_notif_msg_len,
@@ -1749,7 +1755,8 @@ nixlLibfabricEngine::checkXfer(nixlBackendReqH *handle) const {
         }
 
         NIXL_DEBUG << "Data transfer completed successfully";
-        if (backend_handle->has_notif && backend_handle->operation_ == nixl_xfer_op_t::NIXL_READ) {
+        if (backend_handle->has_notif &&
+            (backend_handle->operation_ == nixl_xfer_op_t::NIXL_READ || write_no_imm_)) {
             nixl_status_t notif_status = notifSendPriv(backend_handle->remote_agent_,
                                                        backend_handle->binary_notifs,
                                                        backend_handle->total_notif_msg_len,
