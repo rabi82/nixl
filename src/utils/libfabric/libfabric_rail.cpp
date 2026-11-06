@@ -630,6 +630,29 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
             throw std::runtime_error("fi_ep_bind av failed for rail " + std::to_string(rail_id));
         }
 
+        // Bind an event queue. Without one, the EFA provider abort()s the whole process when
+        // an internal operation fails, e.g. the first write to a peer that has already exited
+        // ("Bad queue pair number"). With one, it reports the error here and the process
+        // keeps serving its other peers. Optional: a provider that refuses runs without.
+        {
+            struct fi_eq_attr eq_attr = {};
+            eq_attr.wait_obj = FI_WAIT_NONE;
+            ret = fi_eq_open(fabric, &eq_attr, &eq, NULL);
+            if (ret == 0) {
+                ret = fi_ep_bind(endpoint, &eq->fid, 0);
+                if (ret) {
+                    NIXL_WARN << "fi_ep_bind eq failed for rail " << rail_id << ": "
+                              << fi_strerror(-ret) << "; provider errors may abort";
+                    fi_close(&eq->fid);
+                    eq = nullptr;
+                }
+            } else {
+                NIXL_WARN << "fi_eq_open failed for rail " << rail_id << ": " << fi_strerror(-ret)
+                          << "; provider errors may abort";
+                eq = nullptr;
+            }
+        }
+
         // On runtimes the shm provider cannot serve, disable it so that intra-node
         // transfers stay on the EFA path.
         if (!shmProviderSupportsRuntime(runtime_)) {
@@ -800,6 +823,13 @@ nixlLibfabricRail::cleanup() {
         }
         av = nullptr;
     }
+    if (eq) {
+        int ret = fi_close(&eq->fid);
+        if (ret) {
+            NIXL_WARN << "fi_close eq failed for rail " << rail_id << ": " << fi_strerror(-ret);
+        }
+        eq = nullptr;
+    }
 
     // STEP 3: Clean up request pools while domain is still valid
     // This ensures all memory registrations (MRs) are properly deregistered before domain closure
@@ -884,6 +914,10 @@ nixlLibfabricRail::reapCompletions(nixl_status_t &first_error) {
         }
     }
     // CQ lock released here - completion is now local data
+    if (eq && ++eq_poll_countdown_ >= 4096) {
+        eq_poll_countdown_ = 0;
+        pollEventQueue();
+    }
     if (stats_enabled_) {
         statsOnReap(ret > 0 ? ret : 0);
     }
@@ -1502,6 +1536,41 @@ nixlLibfabricRail::drainPostQueue() {
         stats_.drain_posts.fetch_add(post_req_count, std::memory_order_relaxed);
     }
     return NIXL_SUCCESS;
+}
+
+void
+nixlLibfabricRail::pollEventQueue() {
+    struct fi_eq_err_entry err = {};
+    uint32_t event;
+    struct fi_eq_entry entry;
+    for (int i = 0; i < 16; ++i) {
+        ssize_t ret;
+        {
+            const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
+            ret = fi_eq_read(eq, &event, &entry, sizeof(entry), 0);
+            if (ret == -FI_EAVAIL) {
+                memset(&err, 0, sizeof(err));
+                ret = fi_eq_readerr(eq, &err, 0);
+                if (ret > 0) {
+                    ret = -FI_EAVAIL;
+                }
+            }
+        }
+        if (ret == -FI_EAGAIN) {
+            return;
+        }
+        if (ret == -FI_EAVAIL) {
+            eq_errors_.fetch_add(1, std::memory_order_relaxed);
+            NIXL_ERROR << "Provider error on rail " << rail_id << " (" << device_name
+                       << "): " << fi_strerror(err.err) << ", prov_errno " << err.prov_errno
+                       << ". A peer may have exited; transfers to it will not complete.";
+            continue;
+        }
+        if (ret < 0) {
+            return;
+        }
+        NIXL_DEBUG << "Event " << event << " on rail " << rail_id;
+    }
 }
 
 void

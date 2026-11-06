@@ -664,6 +664,13 @@ private:
     struct fid_domain *domain; // from rail_domains[rail_id]
     struct fid_cq *cq; // from rail_cqs[rail_id]
     struct fid_av *av; // from rail_avs[rail_id]
+    struct fid_eq *eq = nullptr; // provider error reports (keeps EFA from abort()ing)
+    std::atomic<uint64_t> eq_errors_{0};
+    uint32_t eq_poll_countdown_ = 0;
+
+    /** Drain the event queue and log provider errors. Called from the reap path. */
+    void
+    pollEventQueue();
 
     // Serializes every libfabric call on this rail's endpoint, CQ and AV. The rail opens its
     // domain with FI_THREAD_COMPLETION, under which the provider takes no locks for these
