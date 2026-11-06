@@ -700,6 +700,10 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
             NIXL_ERROR << "fi_getname failed for rail " << rail_id << ": " << fi_strerror(-ret);
             throw std::runtime_error("fi_getname failed for rail " + std::to_string(rail_id));
         }
+        if (stats_enabled_) {
+            NIXL_INFO << "LFADDR local rail " << rail_id << " dev " << device_name << " "
+                      << LibfabricUtils::hexdump(ep_name, ep_name_len);
+        }
 
         // Initialize control request pool with buffers
         nixl_status_t status =
@@ -2002,6 +2006,10 @@ nixlLibfabricRail::insertAddress(const void *addr,
 
     // Kept together with the insert so the table cannot drift from the AV.
     mapSourceAddress(*fi_addr_out, agent_idx);
+    if (stats_enabled_) {
+        NIXL_INFO << "LFADDR av rail " << rail_id << " agent " << agent_idx << " fi_addr "
+                  << *fi_addr_out << " " << LibfabricUtils::hexdump(addr, 32);
+    }
 
     return NIXL_SUCCESS;
 }

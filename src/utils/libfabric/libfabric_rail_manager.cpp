@@ -425,6 +425,15 @@ nixlLibfabricRailManager::submitOnRail(nixlLibfabricReq::OpType op_type,
                                        bool is_cuda_vram) {
     nixlLibfabricRail &rail = *rails_[rail_id];
     const bool is_write = (op_type == nixlLibfabricReq::WRITE);
+    {
+        static const bool trace_posts = getenv("NIXL_LIBFABRIC_STATS") != nullptr;
+        static std::atomic<int> traced{0};
+        if (trace_posts && traced.fetch_add(1, std::memory_order_relaxed) < 4) {
+            NIXL_INFO << "LFPOST " << (is_write ? "WRITE" : "READ") << " rail " << rail_id
+                      << " dest fi_addr " << dest_addr << " len " << length << " remote_addr 0x"
+                      << std::hex << remote_addr << " key 0x" << remote_key << std::dec;
+        }
+    }
     const uint64_t imm_data = is_write ?
         NIXL_MAKE_IMM_DATA(NIXL_LIBFABRIC_MSG_TRANSFER, xfer_id, LibfabricUtils::getNextSeqId()) :
         0;
