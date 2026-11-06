@@ -424,7 +424,7 @@ struct nixlLibfabricPostRequest {
  * the final count.
  */
 struct nixlLibfabricDoneBatch {
-    static constexpr int kSlots = 16;
+    static constexpr int kSlots = 8;
     std::atomic<size_t> *ctr[kSlots];
     size_t n[kSlots];
     int used = 0;
@@ -684,8 +684,8 @@ private:
     post_ring_t post_ring_;
 
     // the post/poll interleave ratio constants
-    static constexpr size_t POST_MAX_BATCH_SIZE = 1024;
-    static constexpr size_t POST_POLL_INTERLEAVE_RATIO = 128;
+    static constexpr size_t POST_MAX_BATCH_SIZE = 256;
+    static constexpr size_t POST_POLL_INTERLEAVE_RATIO = 32;
 
     // Whether a progress thread is handling CQ draining
     bool progress_thread_enabled_ = false;
