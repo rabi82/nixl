@@ -491,7 +491,7 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
       progress_thread_delay_(std::chrono::microseconds(init_params->pthrDelay)),
       write_no_imm_([] {
           const char *e = getenv("NIXL_LIBFABRIC_WRITE_NO_IMM");
-          return !(e && std::string(e) == "0");
+          return e && std::string(e) == "1";
       }()),
       rail_manager_(NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD),
       post_thread_count_(NIXL_LIBFABRIC_DEFAULT_POST_THREADS),
@@ -619,9 +619,10 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
             NIXL_INFO << "Starting Progress thread for rails with delay: "
                       << progress_thread_delay_.count() << " microseconds";
             progress_thread_stop_ = false;
-            // Two threads split the rails by default, since one thread runs out of CPU in the
-            // provider's post and CQ paths before two NICs are busy. Override with
-            // NIXL_LIBFABRIC_NUM_PROGRESS_THREADS or the num_progress_threads parameter.
+            // One thread runs out of CPU in the provider's post and CQ paths before two NICs are
+            // busy; NIXL_LIBFABRIC_NUM_PROGRESS_THREADS (or the num_progress_threads parameter)
+            // splits the rails over several threads. Default 1 until an intermittent EFA
+            // "Bad queue pair" abort on the first WRITE to a new peer with 2 threads is fixed.
             num_progress_threads_ = NIXL_LIBFABRIC_DEFAULT_PROGRESS_THREADS;
             if (const char *env = getenv("NIXL_LIBFABRIC_NUM_PROGRESS_THREADS")) {
                 num_progress_threads_ = std::max<long>(1, strtol(env, nullptr, 10));
