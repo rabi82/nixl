@@ -913,10 +913,19 @@ nixlLibfabricRail::reapCompletions(nixl_status_t &first_error) {
 nixl_status_t
 nixlLibfabricRail::progressCompletionQueue() {
     // Completion processing FIRST — process arrivals before posting new items
+    // Keep reaping while the CQ hands back full batches, so completions do not pile up
+    // behind one short read per pass.
     nixl_status_t first_error = NIXL_SUCCESS;
-    const int ret = reapCompletions(first_error);
-    if (ret < 0 || first_error != NIXL_SUCCESS) {
-        return first_error != NIXL_SUCCESS ? first_error : NIXL_ERR_BACKEND;
+    int ret = 0;
+    for (int pass = 0; pass < 8; ++pass) {
+        const int n = reapCompletions(first_error);
+        if (n < 0 || first_error != NIXL_SUCCESS) {
+            return first_error != NIXL_SUCCESS ? first_error : NIXL_ERR_BACKEND;
+        }
+        ret += n;
+        if (n < NIXL_LIBFABRIC_CQ_BATCH_SIZE) {
+            break;
+        }
     }
 
     // PT-owns-endpoint: drain pending posts AFTER processing completions
