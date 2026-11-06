@@ -393,7 +393,7 @@ nixlLibfabricBackendH::nixlLibfabricBackendH(nixl_xfer_op_t op, const std::strin
     : completed_requests_(0),
       submitted_requests_(0),
       error_status_(NIXL_SUCCESS),
-      successful_requests_(0),
+      failed_requests_(0),
       xfer_error_sent_(false),
       operation_(op),
       remote_agent_(remote_agent),
@@ -415,9 +415,14 @@ void
 nixlLibfabricBackendH::init_request_tracking(size_t num_requests) {
     submitted_requests_.store(num_requests);
     completed_requests_.store(0);
-    successful_requests_.store(0);
+    failed_requests_.store(0);
     error_status_.store(NIXL_SUCCESS);
     NIXL_DEBUG << "Initialized request tracking for " << num_requests << " requests";
+}
+
+void
+nixlLibfabricBackendH::onRequestError(void *ctx, nixl_status_t status) {
+    static_cast<nixlLibfabricBackendH *>(ctx)->complete_request(status);
 }
 
 void
@@ -426,15 +431,11 @@ nixlLibfabricBackendH::complete_request(nixl_status_t status) {
         nixl_status_t expected = NIXL_SUCCESS;
         error_status_.compare_exchange_strong(
             expected, status, std::memory_order_relaxed, std::memory_order_relaxed);
-    } else {
-        successful_requests_.fetch_add(1, std::memory_order_relaxed);
+        failed_requests_.fetch_add(1, std::memory_order_relaxed);
     }
     // Release ensures the error store above is visible to any thread that
     // observes the incremented count via an acquire load in is_completed().
     completed_requests_.fetch_add(1, std::memory_order_release);
-    NIXL_DEBUG << "Request completed (status=" << status
-               << "), total completed: " << completed_requests_.load(std::memory_order_relaxed)
-               << "/" << submitted_requests_.load(std::memory_order_relaxed);
 }
 
 size_t
@@ -444,7 +445,11 @@ nixlLibfabricBackendH::get_completed_requests_count() const {
 
 size_t
 nixlLibfabricBackendH::get_successful_requests_count() const {
-    return successful_requests_.load(std::memory_order_acquire);
+    // Successful completions only add to completed_requests_ (in batches), so the successful
+    // count is what completed without a failure.
+    const size_t completed = completed_requests_.load(std::memory_order_acquire);
+    const size_t failed = failed_requests_.load(std::memory_order_relaxed);
+    return completed >= failed ? completed - failed : 0;
 }
 
 size_t
@@ -1392,6 +1397,7 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
         }
     }
 
+    const nixlLibfabricCompletion completion = backend_handle->completion();
     for (int desc_idx = start_idx; desc_idx < end_idx; ++desc_idx) {
         const int rail_id = batch_writes ? batchingRail(local, desc_idx, xfer_base_offset) : -1;
         const bool apply_fi_more =
@@ -1436,9 +1442,7 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
             remote_md->remote_selected_endpoints_,
             conn->rail_remote_addr_list_,
             backend_handle->post_xfer_id,
-            [backend_handle](nixl_status_t status) {
-                backend_handle->complete_request(status);
-            }, // Completion callback
+            completion,
             desc_submitted_count,
             desc_idx,
             xfer_base_offset,

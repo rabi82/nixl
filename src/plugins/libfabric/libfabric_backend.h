@@ -121,13 +121,28 @@ public:
 /** Request handle for multi-rail transfer operations */
 class nixlLibfabricBackendH : public nixlBackendReqH {
 private:
-    std::atomic<size_t> completed_requests_; // Atomic count of completed requests
-    std::atomic<size_t> submitted_requests_; // Total number of submitted requests
+    // Written by the thread that reaps completions (once per CQ batch); on its own cache line
+    // so the caller polling is_completed() does not share a line with other hot fields.
+    alignas(64) std::atomic<size_t> completed_requests_; // Atomic count of completed requests
+    alignas(64) std::atomic<size_t> submitted_requests_; // Total number of submitted requests
     std::atomic<nixl_status_t> error_status_; // Error status from CQ failures
-    std::atomic<size_t> successful_requests_; // Requests that completed without an error
+    std::atomic<size_t> failed_requests_; // Requests that completed with an error
     std::atomic<bool> xfer_error_sent_; // Target already told about the failure
 
+    static void
+    onRequestError(void *ctx, nixl_status_t status);
+
 public:
+    /** Completion sink handed to every data request of this transfer. */
+    nixlLibfabricCompletion
+    completion() {
+        nixlLibfabricCompletion c;
+        c.done = &completed_requests_;
+        c.on_error = &nixlLibfabricBackendH::onRequestError;
+        c.ctx = this;
+        return c;
+    }
+
     uint16_t post_xfer_id;
     const nixl_xfer_op_t operation_;
     const std::string remote_agent_;
@@ -148,7 +163,7 @@ public:
     init_request_tracking(size_t num_requests);
 
     /** Record completion of one request (with status).
-     *  Stores error and bumps successful_requests_ before incrementing the counter so that
+     *  Stores the error and bumps failed_requests_ before incrementing the counter so that
      *  is_completed() observers always see the error_status_ that caused the transition and the
      *  final successful count. */
     void

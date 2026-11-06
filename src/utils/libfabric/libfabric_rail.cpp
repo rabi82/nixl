@@ -108,7 +108,10 @@ RequestPool::release(nixlLibfabricReq *req) const {
     req->xfer_id = 0;
     req->chunk_offset = 0;
     req->chunk_size = 0;
-    req->completion_callback = nullptr;
+    if (req->completion_callback) {
+        req->completion_callback = nullptr;
+    }
+    req->data_completion = {};
     memset(&req->ctx, 0, sizeof(fi_context));
 
     // Use pool_index instead of pointer arithmetic for deque compatibility
@@ -126,8 +129,8 @@ RequestPool::release(nixlLibfabricReq *req) const {
 
 nixlLibfabricReq *
 RequestPool::findByContext(void *context) const {
-    std::lock_guard<std::mutex> lock(pool_mutex_);
-
+    // No lock: the context is the request itself (ctx is its first member), so the lookup is a
+    // cast and reads no pool state.
     if (!context) {
         return nullptr;
     }
@@ -819,33 +822,31 @@ nixlLibfabricRail::setXferErrorCallback(
     xferErrorCallback = callback;
 }
 
-// Per-rail completion processing - handles one rail's CQ with configurable blocking behavior
-nixl_status_t
-nixlLibfabricRail::progressCompletionQueue() {
-    // Completion processing FIRST — process arrivals before posting new items
+// Read one CQ batch and process it. Successful data completions are added up per completion
+// counter and applied once per batch.
+int
+nixlLibfabricRail::reapCompletions(nixl_status_t &first_error) {
     struct fi_cq_data_entry completions[NIXL_LIBFABRIC_CQ_BATCH_SIZE];
     fi_addr_t src_addrs[NIXL_LIBFABRIC_CQ_BATCH_SIZE];
-
-    int ret;
     struct fi_cq_err_entry err_entry;
     int err_ret = 0;
+    int ret;
 
     // Only protect libfabric CQ hardware operations
     {
         std::lock_guard<std::mutex> ep_lock(ep_mutex_);
-
-        // Non-blocking read (used by progress thread or fallback)
         ret = fi_cq_readfrom(cq, completions, NIXL_LIBFABRIC_CQ_BATCH_SIZE, src_addrs);
-
         if (ret < 0 && ret != -FI_EAGAIN) {
-            // Handle error - but be careful about fi_cq_readerr
             memset(&err_entry, 0, sizeof(err_entry));
             err_ret = fi_cq_readerr(cq, &err_entry, 0);
         }
     }
     // CQ lock released here - completion is now local data
 
-    if (ret < 0 && ret != -FI_EAGAIN) {
+    if (ret == -FI_EAGAIN) {
+        return 0;
+    }
+    if (ret < 0) {
         NIXL_ERROR << "fi_cq_readfrom returned error " << ret << " on rail " << rail_id << ": "
                    << fi_strerror(-ret);
         if (err_ret > 0) {
@@ -858,7 +859,9 @@ nixlLibfabricRail::progressCompletionQueue() {
             if (err_entry.op_context) {
                 nixlLibfabricReq *req = findRequestFromContext(err_entry.op_context);
                 if (req && req->in_use) {
-                    if (req->completion_callback) {
+                    if (req->data_completion.done) {
+                        req->data_completion.fail(NIXL_ERR_BACKEND);
+                    } else if (req->completion_callback) {
                         req->completion_callback(NIXL_ERR_BACKEND);
                     }
                     releaseRequest(req);
@@ -867,34 +870,35 @@ nixlLibfabricRail::progressCompletionQueue() {
         } else {
             NIXL_ERROR << "fi_cq_readerr failed with " << err_ret;
         }
-        return NIXL_ERR_BACKEND;
+        first_error = NIXL_ERR_BACKEND;
+        return ret;
     }
 
-    if (ret == -FI_EAGAIN) {
-        // No completions - fall through to drainPostQueue
-    }
-
-    if (ret > 0) {
-        nixl_status_t first_error = NIXL_SUCCESS;
-        for (int i = 0; i < ret; ++i) {
-            // Process completion using local data. Callbacks have their own thread safety
-            nixl_status_t status = processCompletionQueueEntry(&completions[i], src_addrs[i]);
-            if (status != NIXL_SUCCESS) {
-                NIXL_ERROR << "Failed to process completion " << i << " out of batch of " << ret
-                           << " on rail " << rail_id << " with status " << status;
-                // Keep draining: these entries are already dequeued, so stopping here would
-                // drop the valid ones behind the failure. Report the first error afterwards.
-                if (first_error == NIXL_SUCCESS) {
-                    first_error = status;
-                }
+    nixlLibfabricDoneBatch done;
+    for (int i = 0; i < ret; ++i) {
+        nixl_status_t status = processCompletionQueueEntry(&completions[i], src_addrs[i], done);
+        if (status != NIXL_SUCCESS) {
+            NIXL_ERROR << "Failed to process completion " << i << " out of batch of " << ret
+                       << " on rail " << rail_id << " with status " << status;
+            // Keep draining: these entries are already dequeued, so stopping here would
+            // drop the valid ones behind the failure. Report the first error afterwards.
+            if (first_error == NIXL_SUCCESS) {
+                first_error = status;
             }
         }
+    }
+    done.flush();
+    return ret;
+}
 
-        if (first_error != NIXL_SUCCESS) {
-            return first_error;
-        }
-
-        NIXL_DEBUG << "Processed " << ret << " completions on rail " << rail_id;
+// Per-rail completion processing - handles one rail's CQ with configurable blocking behavior
+nixl_status_t
+nixlLibfabricRail::progressCompletionQueue() {
+    // Completion processing FIRST — process arrivals before posting new items
+    nixl_status_t first_error = NIXL_SUCCESS;
+    const int ret = reapCompletions(first_error);
+    if (ret < 0 || first_error != NIXL_SUCCESS) {
+        return first_error != NIXL_SUCCESS ? first_error : NIXL_ERR_BACKEND;
     }
 
     // PT-owns-endpoint: drain pending posts AFTER processing completions
@@ -911,31 +915,15 @@ nixlLibfabricRail::progressCompletionQueue() {
 
 void
 nixlLibfabricRail::pollForCompletions() {
-    struct fi_cq_data_entry cq_buf[NIXL_LIBFABRIC_CQ_BATCH_SIZE];
-    fi_addr_t src_addrs[NIXL_LIBFABRIC_CQ_BATCH_SIZE];
-    struct fi_cq_err_entry err_entry = {};
-    int cq_ret;
-    {
-        const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
-        cq_ret = fi_cq_readfrom(cq, cq_buf, NIXL_LIBFABRIC_CQ_BATCH_SIZE, src_addrs);
-        if (cq_ret < 0 && cq_ret != -FI_EAGAIN) {
-            fi_cq_readerr(cq, &err_entry, 0);
-        }
-    }
-    if (cq_ret > 0) {
-        for (int c = 0; c < cq_ret; c++) {
-            processCompletionQueueEntry(&cq_buf[c], src_addrs[c]);
-        }
-    } else if (cq_ret < 0 && cq_ret != -FI_EAGAIN) {
-        NIXL_ERROR << "CQ error in drain interleave on rail " << rail_id << ": "
-                   << fi_strerror(err_entry.err);
-    }
+    nixl_status_t first_error = NIXL_SUCCESS;
+    reapCompletions(first_error);
 }
 
 // Route completion to appropriate handler (rail-specific)
 nixl_status_t
 nixlLibfabricRail::processCompletionQueueEntry(struct fi_cq_data_entry *comp,
-                                               fi_addr_t src_addr) const {
+                                               fi_addr_t src_addr,
+                                               nixlLibfabricDoneBatch &done) const {
     uint64_t flags = comp->flags;
 
     NIXL_TRACE << "Routing completion from rail " << rail_id << " with flags=" << std::hex << flags
@@ -953,11 +941,11 @@ nixlLibfabricRail::processCompletionQueueEntry(struct fi_cq_data_entry *comp,
 
     } else if (flags & FI_WRITE) {
         // Local write completions (fi_writemsg with remote completion) - use context
-        return processLocalTransferCompletion(comp, "write");
+        return processLocalTransferCompletion(comp, "write", done);
 
     } else if (flags & FI_READ) {
         // Local read completions (fi_readdata) - use context
-        return processLocalTransferCompletion(comp, "read");
+        return processLocalTransferCompletion(comp, "read", done);
 
     } else if (flags & FI_REMOTE_WRITE || flags & FI_REMOTE_CQ_DATA) {
         // Remote write completions (from fi_writemsg with remote completion) - use immediate data
@@ -1030,12 +1018,15 @@ nixlLibfabricRail::processLocalSendCompletion(struct fi_cq_data_entry *comp) con
 // Handle local transfer completions (both read and write operations from postXfer)
 nixl_status_t
 nixlLibfabricRail::processLocalTransferCompletion(struct fi_cq_data_entry *comp,
-                                                  const char *operation_type) const {
+                                                  const char *operation_type,
+                                                  nixlLibfabricDoneBatch &done) const {
     // Find the request from context to access the completion callback
     nixlLibfabricReq *req = findRequestFromContext(comp->op_context);
     if (req && req->in_use) { // Only process if request is still valid and in use
-        // Call completion callback if it exists
-        if (req->completion_callback) {
+        if (req->data_completion.done) {
+            // Counted per batch; the counter is applied after the request is released.
+            done.add(req->data_completion.done);
+        } else if (req->completion_callback) {
             NIXL_TRACE << "Calling completion callback for " << operation_type << " request "
                        << req->xfer_id;
             req->completion_callback(NIXL_SUCCESS);
@@ -1319,134 +1310,129 @@ nixlLibfabricRail::enqueuePost(const nixlLibfabricPostRequest &req) {
 
 nixl_status_t
 nixlLibfabricRail::drainPostQueue() {
-    nixlLibfabricPostRequest pr;
-    int posted = 0;
 #if HAVE_CUDA
+    // The CUDA device and context are per thread and only the progress thread drains, so the
+    // device set by an earlier call is still current: set it only when it changes.
+    static thread_local int pt_cuda_device = -1;
+    bool ctx_applied = false;
     bool use_cuda_addr_wa = false;
-    int current_cuda_device = -1;
 #endif
 
     // drain the queue up to configured limit,
     // to ensure requests from other rails do not wait too much time
     size_t post_req_count = 0;
+    nixlLibfabricPostRequest pr;
+    std::unique_lock<std::mutex> ep_lock(ep_mutex_, std::defer_lock);
+    size_t posts_under_lock = 0;
+
     while (post_req_count < POST_MAX_BATCH_SIZE && post_ring_.pop(pr)) {
         ++post_req_count;
-        int ret = -FI_EAGAIN;
 
 #if HAVE_CUDA
         if (pr.is_cuda_vram) {
-            // NOTE: for now we do not call engine to try to set context in work-around mode - this
-            // is postponsed to another PR, which requires substantial refactoring - instead we
-            // directly call cudaSetDevice() when needed
-            use_cuda_addr_wa = false;
-            nixl_status_t status = LibfabricUtils::cudaSetCtx(use_cuda_addr_wa);
-            if (status != NIXL_SUCCESS) {
-                // completion is notified also for failed requests
-                // (otherwise counters would never match)
-                if (pr.req && pr.req->completion_callback) {
-                    pr.req->completion_callback(status);
+            nixl_status_t status = NIXL_SUCCESS;
+            if (!ctx_applied) {
+                // NOTE: for now we do not call engine to try to set context in work-around mode
+                // - this is postponsed to another PR, which requires substantial refactoring -
+                // instead we directly call cudaSetDevice() when needed
+                use_cuda_addr_wa = false;
+                status = LibfabricUtils::cudaSetCtx(use_cuda_addr_wa);
+                ctx_applied = (status == NIXL_SUCCESS);
+                if (use_cuda_addr_wa) {
+                    pt_cuda_device = -1; // the context, not the device, is now current
                 }
-                if (pr.req) {
-                    releaseRequest(pr.req);
-                }
-
-                // defrred request cannot be executed, continue to the next
-                NIXL_ERROR << "Failed to set CUDA context, while posting deferred descriptor";
-                continue;
             }
-
-            // other-wise set cuda device before call if needed
-            if (!use_cuda_addr_wa && pr.device_id != current_cuda_device) {
+            if (status == NIXL_SUCCESS && !use_cuda_addr_wa && pr.device_id != pt_cuda_device) {
                 cudaError_t cuda_ret = cudaSetDevice(pr.device_id);
                 if (cuda_ret != cudaSuccess) {
-                    // completion is notified also for failed requests
-                    // (otherwise counters would never match)
-                    if (pr.req && pr.req->completion_callback) {
-                        pr.req->completion_callback(NIXL_ERR_BACKEND);
-                    }
-                    if (pr.req) {
-                        releaseRequest(pr.req);
-                    }
-
-                    // defrred request cannot be executed, continue to the next
                     NIXL_ERROR << "Failed to set CUDA device " << pr.device_id
                                << " while posting deferred descriptor: "
                                << cudaGetErrorString(cuda_ret);
-                    continue;
+                    status = NIXL_ERR_BACKEND;
+                } else {
+                    pt_cuda_device = pr.device_id;
                 }
-                current_cuda_device = pr.device_id;
+            }
+            if (status != NIXL_SUCCESS) {
+                // completion is notified also for failed requests
+                // (otherwise counters would never match)
+                NIXL_ERROR << "Failed to set CUDA context, while posting deferred descriptor";
+                pr.completion.fail(status);
+                continue;
             }
         }
 #endif
 
-        while (ret == -FI_EAGAIN) {
+        nixlLibfabricReq *req = allocateDataRequest(pr.type == nixlLibfabricPostRequest::WRITE ?
+                                                        nixlLibfabricReq::WRITE :
+                                                        nixlLibfabricReq::READ,
+                                                    pr.xfer_id);
+        if (!req) {
+            NIXL_ERROR << "drainPostQueue: failed to allocate request on rail " << rail_id;
+            pr.completion.fail(NIXL_ERR_BACKEND);
+            continue;
+        }
+        req->data_completion = pr.completion;
+        req->chunk_size = pr.length;
+        req->local_addr = pr.local_addr;
+        req->remote_addr = pr.remote_addr;
+        req->remote_key = pr.remote_key;
+        req->rail_id = rail_id;
+
+        struct iovec iov{};
+        iov.iov_base = pr.local_addr;
+        iov.iov_len = pr.length;
+
+        struct fi_rma_iov rma_iov{};
+        rma_iov.addr = pr.remote_addr;
+        rma_iov.len = pr.length;
+        rma_iov.key = pr.remote_key;
+
+        void *desc = pr.local_desc;
+        struct fi_msg_rma msg = {};
+        msg.msg_iov = &iov;
+        msg.desc = &desc;
+        msg.iov_count = 1;
+        msg.addr = pr.dest_addr;
+        msg.rma_iov = &rma_iov;
+        msg.rma_iov_count = 1;
+        msg.context = &req->ctx;
+        msg.data = pr.immediate_data;
+
+        int ret;
+        while (true) {
+            // Hold the EP lock across consecutive posts; drop it every
+            // POST_POLL_INTERLEAVE_RATIO posts and on EAGAIN to reap completions.
+            if (!ep_lock.owns_lock()) {
+                ep_lock.lock();
+                posts_under_lock = 0;
+            }
             if (pr.type == nixlLibfabricPostRequest::WRITE) {
-                struct iovec iov{};
-                iov.iov_base = pr.local_addr;
-                iov.iov_len = pr.length;
-
-                struct fi_rma_iov rma_iov{};
-                rma_iov.addr = pr.remote_addr;
-                rma_iov.len = pr.length;
-                rma_iov.key = pr.remote_key;
-
-                void *desc = pr.local_desc;
-                struct fi_msg_rma msg = {};
-                msg.msg_iov = &iov;
-                msg.desc = &desc;
-                msg.iov_count = 1;
-                msg.addr = pr.dest_addr;
-                msg.rma_iov = &rma_iov;
-                msg.rma_iov_count = 1;
-                msg.context = &pr.req->ctx;
-                msg.data = pr.immediate_data;
-
-                const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
                 ret = fi_writemsg(endpoint, &msg, pr.fi_flags | FI_REMOTE_CQ_DATA);
             } else {
-                struct iovec iov{};
-                iov.iov_base = pr.local_addr;
-                iov.iov_len = pr.length;
-
-                struct fi_rma_iov rma_iov{};
-                rma_iov.addr = pr.remote_addr;
-                rma_iov.len = pr.length;
-                rma_iov.key = pr.remote_key;
-
-                void *desc = pr.local_desc;
-                struct fi_msg_rma msg = {};
-                msg.msg_iov = &iov;
-                msg.desc = &desc;
-                msg.iov_count = 1;
-                msg.addr = pr.dest_addr;
-                msg.rma_iov = &rma_iov;
-                msg.rma_iov_count = 1;
-                msg.context = &pr.req->ctx;
-
-                const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
                 ret = fi_readmsg(endpoint, &msg, pr.fi_flags);
             }
-
-            if (ret == -FI_EAGAIN) {
-                pollForCompletions();
+            if (ret != -FI_EAGAIN) {
+                break;
             }
+            ep_lock.unlock();
+            pollForCompletions();
         }
 
         if (ret != 0) {
+            if (ep_lock.owns_lock()) {
+                ep_lock.unlock();
+            }
             NIXL_ERROR << "drainPostQueue: post failed ret=" << ret << " (" << fi_strerror(-ret)
                        << ") on rail " << rail_id;
-            if (pr.req && pr.req->completion_callback) {
-                // completion is notified also for failed requests
-                // (otherwise counters would never match)
-                pr.req->completion_callback(NIXL_ERR_BACKEND);
-            }
-            if (pr.req) {
-                releaseRequest(pr.req);
-            }
+            // completion is notified also for failed requests
+            // (otherwise counters would never match)
+            req->data_completion.fail(NIXL_ERR_BACKEND);
+            releaseRequest(req);
             continue;
         }
-        posted++;
-        if (posted % POST_POLL_INTERLEAVE_RATIO == 0) {
+        if (++posts_under_lock == POST_POLL_INTERLEAVE_RATIO) {
+            ep_lock.unlock();
             pollForCompletions();
         }
     }
