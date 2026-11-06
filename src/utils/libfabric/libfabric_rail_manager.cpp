@@ -1091,7 +1091,7 @@ nixlLibfabricRailManager::progressActiveRails() {
     }
 
     if (any_completions) {
-        NIXL_TRACE << "Processed " << rails_to_process.size() << " rails, completions found";
+        NIXL_TRACE << "Processed " << n << " rails, completions found";
     }
     if (first_error != NIXL_SUCCESS) {
         return first_error;
