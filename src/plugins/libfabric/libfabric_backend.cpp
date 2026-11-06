@@ -615,7 +615,22 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
             NIXL_INFO << "Starting Progress thread for rails with delay: "
                       << progress_thread_delay_.count() << " microseconds";
             progress_thread_stop_ = false;
-            progress_thread_ = std::thread(&nixlLibfabricEngine::progressThread, this);
+            // One thread drives every rail by default. NIXL_LIBFABRIC_NUM_PROGRESS_THREADS (or
+            // the num_progress_threads parameter) splits the rails over several threads, since
+            // one thread runs out of CPU in the provider's post and CQ paths.
+            num_progress_threads_ = 1;
+            if (const char *env = getenv("NIXL_LIBFABRIC_NUM_PROGRESS_THREADS")) {
+                num_progress_threads_ = std::max<long>(1, strtol(env, nullptr, 10));
+            }
+            LibfabricUtils::getCustomIntParam(
+                getCustomParams(), "num_progress_threads", num_progress_threads_);
+            num_progress_threads_ =
+                std::max<size_t>(1, std::min(num_progress_threads_, rail_manager_.getNumRails()));
+            progress_thread_ = std::thread(&nixlLibfabricEngine::progressThread, this, 0);
+            for (size_t w = 1; w < num_progress_threads_; ++w) {
+                extra_progress_threads_.emplace_back(&nixlLibfabricEngine::progressThread, this, w);
+            }
+            NIXL_INFO << "Progress threads: " << num_progress_threads_;
 
             if (!progress_thread_.joinable()) {
                 NIXL_ERROR << "Failed to start Progress thread";
@@ -679,6 +694,12 @@ nixlLibfabricEngine::~nixlLibfabricEngine() {
     if (progress_thread_enabled_ && progress_thread_.joinable()) {
         NIXL_DEBUG << "Waiting for Progress thread to exit";
         progress_thread_.join();
+        for (auto &t : extra_progress_threads_) {
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+        extra_progress_threads_.clear();
         NIXL_DEBUG << "Progress thread joined successfully";
     } else if (!progress_thread_enabled_) {
         NIXL_DEBUG << "Progress thread was not running";
@@ -2085,13 +2106,14 @@ nixlLibfabricEngine::getNotifs(notif_list_t &notif_list) {
 
 // Progress thread that continuously processes completions only on rails
 nixl_status_t
-nixlLibfabricEngine::progressThread() {
+nixlLibfabricEngine::progressThread(size_t worker) {
     NIXL_DEBUG << "PT: Thread started successfully for rails only";
     // Main progress loop - continuously process completions only on rails
     while (!progress_thread_stop_.load()) {
         // Process completions only on rails (non-blocking)
         bool any_completions = false;
-        nixl_status_t status = rail_manager_.progressActiveRails();
+        nixl_status_t status =
+            rail_manager_.progressActiveRails(worker, num_progress_threads_);
         if (status == NIXL_SUCCESS) {
             any_completions = true;
             NIXL_DEBUG << "PT: Processed completions on rails";

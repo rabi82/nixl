@@ -282,7 +282,14 @@ public:
      * @return NIXL_SUCCESS if completions processed, NIXL_IN_PROG if none, error on failure
      */
     nixl_status_t
-    progressActiveRails();
+    progressActiveRails() {
+        return progressActiveRails(0, 1);
+    }
+
+    /** Progress only the active rails with rail_id % num_workers == worker, so several
+     *  progress threads can split the rails; each rail is then drained by one thread only. */
+    nixl_status_t
+    progressActiveRails(size_t worker, size_t num_workers);
 
     /** Validate that all rails are properly initialized
      * @return NIXL_SUCCESS if all rails initialized, error code otherwise

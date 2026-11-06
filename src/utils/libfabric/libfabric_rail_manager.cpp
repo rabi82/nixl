@@ -1065,7 +1065,7 @@ nixlLibfabricRailManager::postControlMessage(
 }
 
 nixl_status_t
-nixlLibfabricRailManager::progressActiveRails() {
+nixlLibfabricRailManager::progressActiveRails(size_t worker, size_t num_workers) {
     // Rail 0 always (notifications, SEND/RECV), and every rail with registered memory. The
     // refcounts are read without a lock: a rail that becomes active concurrently is picked up
     // on the next call, and progressing an idle rail is harmless.
@@ -1073,6 +1073,9 @@ nixlLibfabricRailManager::progressActiveRails() {
     nixl_status_t first_error = NIXL_SUCCESS;
     const size_t n = std::min(active_rails_size_, rails_.size());
     for (size_t rail_id = 0; rail_id < n; ++rail_id) {
+        if (num_workers > 1 && rail_id % num_workers != worker) {
+            continue;
+        }
         if (rail_id != 0 && active_rails_[rail_id].load(std::memory_order_relaxed) == 0) {
             continue;
         }

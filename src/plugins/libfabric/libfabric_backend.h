@@ -237,6 +237,9 @@ private:
 
     // Progress thread for rail CQs
     std::thread progress_thread_;
+    // Extra progress threads; thread i (0 = progress_thread_) progresses rails with id % n == i.
+    std::vector<std::thread> extra_progress_threads_;
+    size_t num_progress_threads_ = 1;
     std::atomic<bool> progress_thread_stop_;
 
     // Mutex for connection state tracking
@@ -350,7 +353,7 @@ private:
     postShutdownCompletion();
     // Progress thread for rail CQs
     nixl_status_t
-    progressThread();
+    progressThread(size_t worker = 0);
 
 
     // Engine message processing methods.
