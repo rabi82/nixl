@@ -291,6 +291,16 @@ public:
     nixl_status_t
     progressActiveRails(size_t worker, size_t num_workers);
 
+    /** Latest provider (EQ) error time over all rails, steady_clock ns; 0 if none. */
+    int64_t
+    lastEqErrorNs() const {
+        int64_t latest = 0;
+        for (const auto &rail : rails_) {
+            latest = std::max(latest, rail->lastEqErrorNs());
+        }
+        return latest;
+    }
+
     /** Validate that all rails are properly initialized
      * @return NIXL_SUCCESS if all rails initialized, error code otherwise
      */

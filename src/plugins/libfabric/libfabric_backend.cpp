@@ -390,10 +390,8 @@ nixlLibfabricEngine::vramApplyCtxEx(bool &use_cuda_addr_wa) const {
  *****************************************/
 
 nixlLibfabricBackendH::nixlLibfabricBackendH(nixl_xfer_op_t op, const std::string &remote_agent)
-    : completed_requests_(0),
+    : sink_(new nixlLibfabricXferSink()),
       submitted_requests_(0),
-      error_status_(NIXL_SUCCESS),
-      failed_requests_(0),
       xfer_error_sent_(false),
       operation_(op),
       remote_agent_(remote_agent),
@@ -407,48 +405,66 @@ nixlLibfabricBackendH::nixlLibfabricBackendH(nixl_xfer_op_t op, const std::strin
 }
 
 nixlLibfabricBackendH::~nixlLibfabricBackendH() {
+    delete sink_; // the engine detaches a busy sink before the handle is destroyed
     NIXL_DEBUG << "handle destructor called, address: " << this;
+}
+
+nixlLibfabricXferSink *
+nixlLibfabricBackendH::detachSinkIfBusy() {
+    if (sink_->completed.load(std::memory_order_acquire) ==
+        submitted_requests_.load(std::memory_order_relaxed)) {
+        return nullptr;
+    }
+    nixlLibfabricXferSink *busy = sink_;
+    sink_ = new nixlLibfabricXferSink();
+    return busy;
 }
 
 // Multi-request completion tracking methods
 void
 nixlLibfabricBackendH::init_request_tracking(size_t num_requests) {
     submitted_requests_.store(num_requests);
-    completed_requests_.store(0);
-    failed_requests_.store(0);
-    error_status_.store(NIXL_SUCCESS);
+    sink_->completed.store(0);
+    sink_->failed.store(0);
+    sink_->error.store(NIXL_SUCCESS);
+    abandoned_status_.store(NIXL_SUCCESS);
+    post_time_ = last_progress_time_ = std::chrono::steady_clock::now();
+    last_seen_completed_ = 0;
     NIXL_DEBUG << "Initialized request tracking for " << num_requests << " requests";
 }
 
 void
-nixlLibfabricBackendH::onRequestError(void *ctx, nixl_status_t status) {
-    static_cast<nixlLibfabricBackendH *>(ctx)->complete_request(status);
+nixlLibfabricXferSink::onError(void *ctx, nixl_status_t status) {
+    auto *sink = static_cast<nixlLibfabricXferSink *>(ctx);
+    nixl_status_t expected = NIXL_SUCCESS;
+    sink->error.compare_exchange_strong(
+        expected, status, std::memory_order_relaxed, std::memory_order_relaxed);
+    sink->failed.fetch_add(1, std::memory_order_relaxed);
+    // Release ensures the error store above is visible to any thread that
+    // observes the incremented count via an acquire load in is_completed().
+    sink->completed.fetch_add(1, std::memory_order_release);
 }
 
 void
 nixlLibfabricBackendH::complete_request(nixl_status_t status) {
     if (status != NIXL_SUCCESS) {
-        nixl_status_t expected = NIXL_SUCCESS;
-        error_status_.compare_exchange_strong(
-            expected, status, std::memory_order_relaxed, std::memory_order_relaxed);
-        failed_requests_.fetch_add(1, std::memory_order_relaxed);
+        nixlLibfabricXferSink::onError(sink_, status);
+    } else {
+        sink_->completed.fetch_add(1, std::memory_order_release);
     }
-    // Release ensures the error store above is visible to any thread that
-    // observes the incremented count via an acquire load in is_completed().
-    completed_requests_.fetch_add(1, std::memory_order_release);
 }
 
 size_t
 nixlLibfabricBackendH::get_completed_requests_count() const {
-    return completed_requests_.load();
+    return sink_->completed.load();
 }
 
 size_t
 nixlLibfabricBackendH::get_successful_requests_count() const {
-    // Successful completions only add to completed_requests_ (in batches), so the successful
+    // Successful completions only add to completed (in batches), so the successful
     // count is what completed without a failure.
-    const size_t completed = completed_requests_.load(std::memory_order_acquire);
-    const size_t failed = failed_requests_.load(std::memory_order_relaxed);
+    const size_t completed = sink_->completed.load(std::memory_order_acquire);
+    const size_t failed = sink_->failed.load(std::memory_order_relaxed);
     return completed >= failed ? completed - failed : 0;
 }
 
@@ -465,7 +481,7 @@ nixlLibfabricBackendH::adjust_total_submitted_requests(size_t actual_count) {
 
 nixl_status_t
 nixlLibfabricBackendH::get_error_status() const {
-    return error_status_.load(std::memory_order_acquire);
+    return sink_->error.load(std::memory_order_acquire);
 }
 
 bool
@@ -475,9 +491,9 @@ nixlLibfabricBackendH::claim_xfer_error_send() {
 
 bool
 nixlLibfabricBackendH::is_completed() const {
-    // Acquire pairs with release in complete_request() — guarantees we see
-    // any error_status_ written before the final increment.
-    return completed_requests_.load(std::memory_order_acquire) ==
+    // Acquire pairs with the release in the completion paths — guarantees we see
+    // any error written before the final increment.
+    return sink_->completed.load(std::memory_order_acquire) ==
         submitted_requests_.load(std::memory_order_relaxed);
 }
 
@@ -492,6 +508,11 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
       write_no_imm_([] {
           const char *e = getenv("NIXL_LIBFABRIC_WRITE_NO_IMM");
           return !(e && std::string(e) == "0");
+      }()),
+      dead_peer_timeout_([] {
+          const char *e = getenv("NIXL_LIBFABRIC_DEAD_PEER_TIMEOUT_MS");
+          const long ms = e ? strtol(e, nullptr, 10) : 2000;
+          return std::chrono::milliseconds(ms > 0 ? ms : 2000);
       }()),
       rail_manager_(NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD),
       post_thread_count_(NIXL_LIBFABRIC_DEFAULT_POST_THREADS),
@@ -710,6 +731,18 @@ nixlLibfabricEngine::~nixlLibfabricEngine() {
     }
     NIXL_DEBUG << "All threads stopped, now cleaning up resources";
     cleanup();
+    // Rails are closed, so no request can complete into a parked block any more.
+    std::lock_guard<std::mutex> lock(parked_sinks_mutex_);
+    parked_sinks_.clear();
+}
+
+void
+nixlLibfabricEngine::parkBusySink(nixlLibfabricBackendH *handle) const {
+    nixlLibfabricXferSink *busy = handle->detachSinkIfBusy();
+    if (busy) {
+        std::lock_guard<std::mutex> lock(parked_sinks_mutex_);
+        parked_sinks_.emplace_back(busy);
+    }
 }
 
 /****************************************
@@ -1541,6 +1574,10 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
         backend_handle->total_notif_msg_len = 0;
     }
 
+    // A repost of a handle whose last posting was abandoned with requests in flight gets a
+    // fresh completion block, so stragglers cannot count toward the new posting.
+    parkBusySink(backend_handle);
+
     // Allocate xfer_id once in prepXfer
     backend_handle->post_xfer_id = LibfabricUtils::getNextXferId();
 
@@ -1744,7 +1781,42 @@ nixlLibfabricEngine::checkXfer(nixlBackendReqH *handle) const {
         }
     }
 
+    const nixl_status_t abandoned = backend_handle->abandonedStatus();
+    if (abandoned != NIXL_SUCCESS) {
+        return abandoned;
+    }
+
     // Then check for completions after processing any pending completions
+    if (!backend_handle->is_completed()) {
+        // Dead-peer check. Requests to a peer that has exited never complete; the provider
+        // only reports the failure on the EQ. After such an error, a transfer whose completed
+        // count has not moved for dead_peer_timeout_ is failed. Transfers to healthy peers
+        // keep completing and are not touched.
+        const int64_t err_ns = rail_manager_.lastEqErrorNs();
+        if (err_ns != 0) {
+            const auto now = std::chrono::steady_clock::now();
+            const auto err_time =
+                std::chrono::steady_clock::time_point(std::chrono::nanoseconds(err_ns));
+            const size_t done = backend_handle->get_completed_requests_count();
+            if (done != backend_handle->last_seen_completed_) {
+                backend_handle->last_seen_completed_ = done;
+                backend_handle->last_progress_time_ = now;
+            } else if (err_time >= backend_handle->post_time_ - dead_peer_timeout_) {
+                const auto quiet_since = std::max(backend_handle->last_progress_time_, err_time);
+                if (now - quiet_since > dead_peer_timeout_) {
+                    NIXL_ERROR << "Transfer XFER_ID=" << backend_handle->post_xfer_id << " to "
+                               << backend_handle->remote_agent_ << " made no progress for "
+                               << dead_peer_timeout_.count()
+                               << " ms after a provider error (" << done << " of "
+                               << backend_handle->get_submitted_requests_count()
+                               << " requests done); the peer is likely gone";
+                    backend_handle->abandon(NIXL_ERR_REMOTE_DISCONNECT);
+                    return NIXL_ERR_REMOTE_DISCONNECT;
+                }
+            }
+        }
+    }
+
     if (backend_handle->is_completed()) {
         // Check if any request completed with error
         nixl_status_t err = backend_handle->get_error_status();
@@ -1778,7 +1850,10 @@ nixlLibfabricEngine::releaseReqH(nixlBackendReqH *handle) const {
         return NIXL_SUCCESS;
     }
 
-    delete static_cast<nixlLibfabricBackendH *>(handle);
+    auto *backend_handle = static_cast<nixlLibfabricBackendH *>(handle);
+    // Requests still in flight point at the completion block; keep it alive.
+    parkBusySink(backend_handle);
+    delete backend_handle;
     NIXL_DEBUG << "releaseReqH completed successfully";
     return NIXL_SUCCESS;
 }

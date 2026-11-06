@@ -657,6 +657,12 @@ public:
     fi_info *
     getRailInfo() const;
 
+    /** steady_clock nanoseconds of the last provider error on this rail's EQ, 0 if none. */
+    int64_t
+    lastEqErrorNs() const {
+        return last_eq_error_ns_.load(std::memory_order_acquire);
+    }
+
 private:
     // Core libfabric resources
     struct fi_info *info; // from rail_infos[rail_id]
@@ -666,6 +672,7 @@ private:
     struct fid_av *av; // from rail_avs[rail_id]
     struct fid_eq *eq = nullptr; // provider error reports (keeps EFA from abort()ing)
     std::atomic<uint64_t> eq_errors_{0};
+    std::atomic<int64_t> last_eq_error_ns_{0}; // steady_clock time of the last EQ error
     uint32_t eq_poll_countdown_ = 0;
 
     /** Drain the event queue and log provider errors. Called from the reap path. */

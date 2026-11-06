@@ -119,29 +119,61 @@ public:
 };
 
 /** Request handle for multi-rail transfer operations */
-class nixlLibfabricBackendH : public nixlBackendReqH {
-private:
+/**
+ * Completion counters of one posting of a transfer. Every data request of that posting points
+ * here, so the block must outlive the requests. A posting that is abandoned with requests still
+ * in flight (a dead peer) hands its block to the engine, which frees it at shutdown, after the
+ * rails are closed; late or flushed completions then land in the parked block.
+ */
+struct nixlLibfabricXferSink {
     // Written by the thread that reaps completions (once per CQ batch); on its own cache line
     // so the caller polling is_completed() does not share a line with other hot fields.
-    alignas(64) std::atomic<size_t> completed_requests_; // Atomic count of completed requests
-    alignas(64) std::atomic<size_t> submitted_requests_; // Total number of submitted requests
-    std::atomic<nixl_status_t> error_status_; // Error status from CQ failures
-    std::atomic<size_t> failed_requests_; // Requests that completed with an error
-    std::atomic<bool> xfer_error_sent_; // Target already told about the failure
+    alignas(64) std::atomic<size_t> completed{0};
+    std::atomic<size_t> failed{0};
+    std::atomic<nixl_status_t> error{NIXL_SUCCESS};
 
     static void
-    onRequestError(void *ctx, nixl_status_t status);
+    onError(void *ctx, nixl_status_t status);
+};
+
+class nixlLibfabricBackendH : public nixlBackendReqH {
+private:
+    nixlLibfabricXferSink *sink_; // owned unless detached
+    alignas(64) std::atomic<size_t> submitted_requests_; // Total number of submitted requests
+    std::atomic<bool> xfer_error_sent_; // Target already told about the failure
+    std::atomic<nixl_status_t> abandoned_status_{NIXL_SUCCESS}; // set when given up on
 
 public:
-    /** Completion sink handed to every data request of this transfer. */
+    /** Completion sink handed to every data request of this posting. */
     nixlLibfabricCompletion
     completion() {
         nixlLibfabricCompletion c;
-        c.done = &completed_requests_;
-        c.on_error = &nixlLibfabricBackendH::onRequestError;
-        c.ctx = this;
+        c.done = &sink_->completed;
+        c.on_error = &nixlLibfabricXferSink::onError;
+        c.ctx = sink_;
         return c;
     }
+
+    /** Hand the current sink to the caller if requests may still reference it, and give the
+     *  handle a fresh one. Returns nullptr when nothing is in flight. */
+    nixlLibfabricXferSink *
+    detachSinkIfBusy();
+
+    /** Mark the posting failed without waiting for its requests (a dead peer). */
+    void
+    abandon(nixl_status_t status) {
+        abandoned_status_.store(status, std::memory_order_release);
+    }
+
+    nixl_status_t
+    abandonedStatus() const {
+        return abandoned_status_.load(std::memory_order_acquire);
+    }
+
+    // Dead-peer detection: when the posting started, and when its completed count last moved.
+    std::chrono::steady_clock::time_point post_time_;
+    std::chrono::steady_clock::time_point last_progress_time_;
+    size_t last_seen_completed_ = 0;
 
     uint16_t post_xfer_id;
     const nixl_xfer_op_t operation_;
@@ -210,6 +242,18 @@ private:
 
     // Data writes carry no remote CQ data; WRITE notifications go out after completion.
     const bool write_no_imm_;
+
+    // A transfer that makes no progress for this long after a provider error is failed with
+    // NIXL_ERR_REMOTE_DISCONNECT (NIXL_LIBFABRIC_DEAD_PEER_TIMEOUT_MS, default 2000).
+    std::chrono::milliseconds dead_peer_timeout_;
+
+    // Completion blocks of abandoned postings; requests may still point at them, so they
+    // are freed only after the rails are closed.
+    mutable std::mutex parked_sinks_mutex_;
+    mutable std::vector<std::unique_ptr<nixlLibfabricXferSink>> parked_sinks_;
+
+    void
+    parkBusySink(nixlLibfabricBackendH *handle) const;
 
     // Rail Manager - Stack allocated for better performance (mutable for const methods)
     mutable nixlLibfabricRailManager rail_manager_;

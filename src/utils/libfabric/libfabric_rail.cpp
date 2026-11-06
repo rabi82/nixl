@@ -1560,6 +1560,10 @@ nixlLibfabricRail::pollEventQueue() {
         }
         if (ret == -FI_EAVAIL) {
             eq_errors_.fetch_add(1, std::memory_order_relaxed);
+            last_eq_error_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now().time_since_epoch())
+                                        .count(),
+                                    std::memory_order_release);
             NIXL_ERROR << "Provider error on rail " << rail_id << " (" << device_name
                        << "): " << fi_strerror(err.err) << ", prov_errno " << err.prov_errno
                        << ". A peer may have exited; transfers to it will not complete.";
