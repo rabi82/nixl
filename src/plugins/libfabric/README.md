@@ -154,6 +154,11 @@ The following table summarizes briefly the plugin's runtime configuration:
 | num_threads | Enables a thread pool for parallel descriptor posting in postXfer | Backend init param | integer | 4, 8 | Default 0 keeps the serial posting path |
 | split_batch_size | Minimum descriptor count before postXfer uses the posting thread pool | Backend init param | integer | 1024, 4096 | Default 1024; only applies when num_threads is greater than 0 |
 | dmabuf_mapping | Selects the CUDA dmabuf mapping type a VRAM_SEG registration exports for an EFA rail | Backend init param or `NIXL_LIBFABRIC_DMABUF_MAPPING` environment variable | auto, pcie, default, off | auto, off | Default auto takes a per-NIC verdict from the PCIe-path topology; pcie and default force the GPU's PCIe aperture (BAR1) or the platform default mapping on every device; off registers by virtual address. Only applies to CUDA device memory on an EFA provider whose fabric carries libfabric API 1.20 or newer |
+| num_progress_threads | Number of progress threads; thread i progresses the rails whose id % N == i | Backend init param or `NIXL_LIBFABRIC_NUM_PROGRESS_THREADS` environment variable | integer | 1, 2 | Default 2, capped at the rail count. Only applies with the progress thread enabled |
+| write no-imm | Data writes carry no remote CQ data; the initiator sends the WRITE notification after its writes complete, as for READ | `NIXL_LIBFABRIC_WRITE_NO_IMM` environment variable | 0, 1 | 0 | Default 1. Set 0 to give every write remote CQ data, which costs the target a receive per write |
+| write delivery complete | Adds FI_DELIVERY_COMPLETE to data writes | `NIXL_LIBFABRIC_WRITE_DC` environment variable | 0, 1 | 1 | Default 0 |
+| threading | Domain threading model | `NIXL_LIBFABRIC_THREADING` environment variable | domain, completion | completion | Default domain (FI_THREAD_DOMAIN); the plugin serializes every call on a rail |
+| stats | Logs per-rail post, CQ and in-flight counters at shutdown (INFO level) | `NIXL_LIBFABRIC_STATS` environment variable | set or unset | 1 | Off by default |
 
 ## API Reference
 

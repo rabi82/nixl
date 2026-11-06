@@ -703,7 +703,7 @@ private:
         std::atomic<uint64_t> drain_posts{0};
     };
     bool stats_enabled_ = false;
-    uint64_t write_flags_ = FI_REMOTE_CQ_DATA; // flags added to every data write
+    uint64_t write_flags_ = 0; // flags added to every data write
     mutable RailStats stats_;
 
     void
