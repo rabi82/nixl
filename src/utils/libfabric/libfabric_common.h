@@ -117,7 +117,7 @@ constexpr const char *NIXL_HANDSHAKE_TAG_CONN = "conn";
 #define NIXL_LIBFABRIC_CQ_BATCH_SIZE 64
 
 // Progress threads per engine when the progress thread is enabled
-#define NIXL_LIBFABRIC_DEFAULT_PROGRESS_THREADS 1
+#define NIXL_LIBFABRIC_DEFAULT_PROGRESS_THREADS 2
 
 // Giga (decimal) constant
 constexpr inline uint64_t NIXL_LIBFABRIC_GIGA = 1000ull * 1000ull * 1000ull;

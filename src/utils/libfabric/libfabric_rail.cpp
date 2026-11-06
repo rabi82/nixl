@@ -494,15 +494,14 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
         thread_domain_ = !completion_model;
     }
     stats_enabled_ = getenv("NIXL_LIBFABRIC_STATS") != nullptr;
-    // NIXL_LIBFABRIC_WRITE_NO_IMM=1: data writes carry no remote CQ data, so the target
-    // consumes no receive per write; the initiator sends the notification once its writes
-    // complete (as for READ). Off by default: a write to a peer that has not yet sent
-    // anything to this endpoint aborts in the EFA provider (QP not found).
+    // By default data writes carry no remote CQ data, so the target consumes no receive per
+    // write; the initiator sends the notification once its writes complete (as for READ).
+    // NIXL_LIBFABRIC_WRITE_NO_IMM=0 restores per-write remote CQ data.
     // NIXL_LIBFABRIC_WRITE_DC=1 also asks for delivery complete.
     {
         const char *e = getenv("NIXL_LIBFABRIC_WRITE_NO_IMM");
         const char *dc = getenv("NIXL_LIBFABRIC_WRITE_DC");
-        write_flags_ = (e && std::string(e) == "1") ? 0 : FI_REMOTE_CQ_DATA;
+        write_flags_ = (e && std::string(e) == "0") ? FI_REMOTE_CQ_DATA : 0;
         if (dc && std::string(dc) == "1") {
             write_flags_ |= FI_DELIVERY_COMPLETE;
         }
