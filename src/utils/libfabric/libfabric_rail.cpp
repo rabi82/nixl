@@ -236,8 +236,15 @@ ControlRequestPool::createBufferChunk(size_t chunk_size, BufferChunk &chunk) {
     chunk.size = chunk_size;
 
     // Register buffer chunk with libfabric
+    std::unique_lock<std::mutex> domain_lock;
+    if (domain_mutex_) {
+        domain_lock = std::unique_lock<std::mutex>(*domain_mutex_);
+    }
     int ret =
         fi_mr_reg(domain_, chunk.buffer, chunk_size, FI_SEND | FI_RECV, 0, 0, 0, &chunk.mr, NULL);
+    if (domain_lock.owns_lock()) {
+        domain_lock.unlock();
+    }
     if (ret) {
         NIXL_ERROR << "CreateBufferChunk on Rail " << rail_id_
                    << " fi_mr_reg failed for buffer chunk: " << fi_strerror(-ret)
@@ -255,10 +262,11 @@ ControlRequestPool::createBufferChunk(size_t chunk_size, BufferChunk &chunk) {
 }
 
 nixl_status_t
-ControlRequestPool::initialize(struct fid_domain *domain) {
+ControlRequestPool::initialize(struct fid_domain *domain, std::mutex *domain_mutex) {
 
     // Store domain for future expansions
     domain_ = domain;
+    domain_mutex_ = domain_mutex;
 
     // Create initial buffer chunk
     BufferChunk initial_chunk;
@@ -475,7 +483,16 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
         hints->domain_attr->mr_key_size = 2;
     }
     hints->domain_attr->name = strdup(device_name.c_str());
-    hints->domain_attr->threading = FI_THREAD_COMPLETION;
+    // FI_THREAD_DOMAIN by default: every libfabric call on this rail's domain, endpoint, CQ,
+    // AV and MRs is serialized by ep_mutex_, so the provider can skip its own locks on the
+    // post and completion paths. NIXL_LIBFABRIC_THREADING=completion restores the old model.
+    {
+        const char *threading_env = getenv("NIXL_LIBFABRIC_THREADING");
+        const bool completion_model =
+            threading_env && std::string(threading_env) == "completion";
+        hints->domain_attr->threading = completion_model ? FI_THREAD_COMPLETION : FI_THREAD_DOMAIN;
+        thread_domain_ = !completion_model;
+    }
 
     // The EFA provider accepts FI_MR_DMABUF from libfabric API 1.20 on, so request 1.20
     // where the library provides it and 1.18 elsewhere. The fabric carries the requested
@@ -668,7 +685,8 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
         }
 
         // Initialize control request pool with buffers
-        nixl_status_t status = control_request_pool_.initialize(domain);
+        nixl_status_t status =
+            control_request_pool_.initialize(domain, thread_domain_ ? &ep_mutex_ : nullptr);
         if (status != NIXL_SUCCESS) {
             throw std::runtime_error("Failed to initialize control request pool for rail " +
                                      std::to_string(rail_id));
@@ -1785,8 +1803,12 @@ nixlLibfabricRail::registerMemory(void *buffer,
         mr_attr.iov_count = 1;
     }
 
-    // fi_mr_regattr is a domain-level call, not tied to the endpoint or CQ, so it runs
-    // without the EP lock.
+    // fi_mr_regattr is a domain-level call. Under FI_THREAD_DOMAIN the application serializes
+    // every call on the domain, so it takes the EP lock as well.
+    std::unique_lock<std::mutex> domain_lock(ep_mutex_, std::defer_lock);
+    if (thread_domain_) {
+        domain_lock.lock();
+    }
     int ret = fi_mr_regattr(domain, &mr_attr, regattr_flags, &mr);
 
     if (ret && use_dmabuf) {
@@ -1817,7 +1839,10 @@ nixlLibfabricRail::registerMemory(void *buffer,
 
     // Only an MR bound to the endpoint (FI_MR_ENDPOINT) needs the lock.
     if (info->domain_attr->mr_mode & FI_MR_ENDPOINT) {
-        const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
+        std::unique_lock<std::mutex> ep_lock(ep_mutex_, std::defer_lock);
+        if (!domain_lock.owns_lock()) {
+            ep_lock.lock();
+        }
         ret = fi_mr_bind(mr, &endpoint->fid, 0);
         if (ret) {
             NIXL_ERROR << "fi_mr_bind failed on rail " << rail_id << ": " << fi_strerror(-ret);
@@ -1834,6 +1859,9 @@ nixlLibfabricRail::registerMemory(void *buffer,
     }
 
     uint64_t key = fi_mr_key(mr);
+    if (domain_lock.owns_lock()) {
+        domain_lock.unlock();
+    }
     if (key == FI_KEY_NOTAVAIL) {
         NIXL_ERROR << "fi_mr_key returned FI_KEY_NOTAVAIL on rail " << rail_id;
         deregisterMemory(mr);
@@ -1861,7 +1889,7 @@ nixlLibfabricRail::deregisterMemory(struct fid_mr *mr) const {
 
     // Same rule as registerMemory: only an MR bound to the endpoint needs the EP lock.
     std::unique_lock<std::mutex> ep_lock(ep_mutex_, std::defer_lock);
-    if (info->domain_attr->mr_mode & FI_MR_ENDPOINT) {
+    if (thread_domain_ || (info->domain_attr->mr_mode & FI_MR_ENDPOINT)) {
         ep_lock.lock();
     }
     int ret = fi_close(&mr->fid);

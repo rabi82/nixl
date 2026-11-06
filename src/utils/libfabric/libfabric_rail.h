@@ -185,7 +185,7 @@ public:
 
     /** Initialize pool with buffers */
     nixl_status_t
-    initialize(struct fid_domain *domain);
+    initialize(struct fid_domain *domain, std::mutex *domain_mutex = nullptr);
 
     /** Allocate control request with size validation */
     nixlLibfabricReq *
@@ -206,6 +206,7 @@ private:
 
     std::vector<BufferChunk> buffer_chunks_; ///< Multiple buffer chunks for expansion
     struct fid_domain *domain_; ///< Domain for MR registration (stored during init)
+    std::mutex *domain_mutex_ = nullptr; ///< Serializes fi_mr_reg under FI_THREAD_DOMAIN
     size_t chunk_size_; ///< Size of each buffer chunk
 };
 
@@ -674,6 +675,9 @@ private:
     //  - Keep it innermost: never run completion handling or callbacks while holding it,
     //    they take other locks and may re-enter (e.g. postRecv from a recv completion).
     mutable std::mutex ep_mutex_;
+
+    // Domain opened with FI_THREAD_DOMAIN: domain-level calls (MR registration) take ep_mutex_.
+    bool thread_domain_ = true;
 
     // Lock-free MPSC ring: main thread pushes, PT pops and posts
     using post_ring_t = MpscRing<nixlLibfabricPostRequest>;
