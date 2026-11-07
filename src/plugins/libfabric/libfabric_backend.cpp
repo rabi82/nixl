@@ -514,6 +514,15 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
           const long ms = e ? strtol(e, nullptr, 10) : 2000;
           return std::chrono::milliseconds(ms > 0 ? ms : 2000);
       }()),
+      merge_descs_([] {
+          const char *e = getenv("NIXL_LIBFABRIC_MERGE");
+          return !(e && std::string(e) == "0");
+      }()),
+      merge_max_bytes_([] {
+          const char *e = getenv("NIXL_LIBFABRIC_MERGE_MAX_BYTES");
+          const long long v = e ? strtoll(e, nullptr, 10) : 0;
+          return v > 0 ? static_cast<size_t>(v) : static_cast<size_t>(16) << 20;
+      }()),
       rail_manager_(NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD),
       post_thread_count_(NIXL_LIBFABRIC_DEFAULT_POST_THREADS),
       post_split_batch_size_(NIXL_LIBFABRIC_DEFAULT_POST_SPLIT_BATCH_SIZE),
@@ -1520,13 +1529,96 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
     return NIXL_SUCCESS;
 }
 
+size_t
+nixlLibfabricEngine::mergeContiguous(const nixl_meta_dlist_t &local,
+                                     const nixl_meta_dlist_t &remote,
+                                     nixl_meta_dlist_t &merged_local,
+                                     nixl_meta_dlist_t &merged_remote) const {
+    const int n = local.descCount();
+    if (!merge_descs_ || n < 2 || remote.descCount() != n) {
+        return 0;
+    }
+    // Merge a descriptor into the previous one when both sides continue it byte for byte,
+    // in the same registration on each side and on the same device.
+    auto continues = [&](int prev_first, uintptr_t prev_local_end, uintptr_t prev_remote_end,
+                         size_t prev_len, int i) {
+        return local[i].addr == prev_local_end && remote[i].addr == prev_remote_end &&
+            local[i].metadataP == local[prev_first].metadataP &&
+            remote[i].metadataP == remote[prev_first].metadataP &&
+            local[i].devId == local[prev_first].devId &&
+            remote[i].devId == remote[prev_first].devId &&
+            prev_len + local[i].len <= merge_max_bytes_ && local[i].len == remote[i].len;
+    };
+    // First pass: count the merges, so a list with none costs no copy.
+    size_t merges = 0;
+    {
+        int first = 0;
+        uintptr_t lend = local[0].addr + local[0].len;
+        uintptr_t rend = remote[0].addr + remote[0].len;
+        size_t len = local[0].len;
+        for (int i = 1; i < n; ++i) {
+            if (continues(first, lend, rend, len, i)) {
+                ++merges;
+                len += local[i].len;
+            } else {
+                first = i;
+                len = local[i].len;
+            }
+            lend = local[i].addr + local[i].len;
+            rend = remote[i].addr + remote[i].len;
+        }
+    }
+    if (merges == 0) {
+        return 0;
+    }
+    merged_local.clear();
+    merged_remote.clear();
+    merged_local.reserve(n - merges);
+    merged_remote.reserve(n - merges);
+    int first = 0;
+    size_t len = local[0].len;
+    for (int i = 1; i <= n; ++i) {
+        if (i < n &&
+            continues(first,
+                      local[i - 1].addr + local[i - 1].len,
+                      remote[i - 1].addr + remote[i - 1].len,
+                      len,
+                      i)) {
+            len += local[i].len;
+            continue;
+        }
+        merged_local.addDesc(
+            nixlMetaDesc(local[first].addr, len, local[first].devId, local[first].metadataP));
+        merged_remote.addDesc(
+            nixlMetaDesc(remote[first].addr, len, remote[first].devId, remote[first].metadataP));
+        if (i < n) {
+            first = i;
+            len = local[i].len;
+        }
+    }
+    return merges;
+}
+
 nixl_status_t
 nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
-                              const nixl_meta_dlist_t &local,
-                              const nixl_meta_dlist_t &remote,
+                              const nixl_meta_dlist_t &in_local,
+                              const nixl_meta_dlist_t &in_remote,
                               const std::string &remote_agent,
                               nixlBackendReqH *&handle,
                               const nixl_opt_b_args_t *opt_args) const {
+    // Goal B: post one RDMA operation per run of descriptors that are contiguous on both sides.
+    // The merged lists live for this call only; nothing below keeps a reference past it.
+    thread_local nixl_meta_dlist_t merged_local(DRAM_SEG);
+    thread_local nixl_meta_dlist_t merged_remote(DRAM_SEG);
+    if (merged_local.getType() != in_local.getType()) {
+        merged_local = nixl_meta_dlist_t(in_local.getType()); // keeps capacity across calls
+    }
+    if (merged_remote.getType() != in_remote.getType()) {
+        merged_remote = nixl_meta_dlist_t(in_remote.getType());
+    }
+    const bool merged = mergeContiguous(in_local, in_remote, merged_local, merged_remote) > 0;
+    const nixl_meta_dlist_t &local = merged ? merged_local : in_local;
+    const nixl_meta_dlist_t &remote = merged ? merged_remote : in_remote;
 
     // Validate connection
     std::shared_ptr<nixlLibfabricConnection> conn;

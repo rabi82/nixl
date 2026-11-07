@@ -255,6 +255,19 @@ private:
     void
     parkBusySink(nixlLibfabricBackendH *handle) const;
 
+    // Goal B: merge descriptors contiguous on both sides into one RDMA operation
+    // (NIXL_LIBFABRIC_MERGE, default 1), up to NIXL_LIBFABRIC_MERGE_MAX_BYTES (default 16 MiB).
+    const bool merge_descs_;
+    const size_t merge_max_bytes_;
+
+    /** Fill merged_local/remote with the merged lists and return the number of merges;
+     *  0 means nothing merged and the outputs are untouched. */
+    size_t
+    mergeContiguous(const nixl_meta_dlist_t &local,
+                    const nixl_meta_dlist_t &remote,
+                    nixl_meta_dlist_t &merged_local,
+                    nixl_meta_dlist_t &merged_remote) const;
+
     // Rail Manager - Stack allocated for better performance (mutable for const methods)
     mutable nixlLibfabricRailManager rail_manager_;
 
