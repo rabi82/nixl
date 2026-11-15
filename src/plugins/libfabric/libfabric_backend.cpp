@@ -1377,6 +1377,14 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
                                          size_t &submitted_count) const {
     submitted_count = 0;
 
+    // Posts are staged per thread and handed to the progress thread in batches; make sure
+    // everything staged here reaches the rings on every exit path.
+    struct FlushStagedPosts {
+        ~FlushStagedPosts() {
+            nixlLibfabricRailManager::flushDeferredPosts();
+        }
+    } flush_staged_posts;
+
 #ifdef HAVE_CUDA
     // NOTE: when progress thread is enabled and the call is deferred via ring-buffer, this should
     // take place in the context of the progress thread
@@ -2104,8 +2112,17 @@ nixlLibfabricEngine::getNotifs(notif_list_t &notif_list) {
 nixl_status_t
 nixlLibfabricEngine::progressThread() {
     NIXL_DEBUG << "PT: Thread started successfully for rails only";
+    // Run the progress thread on the NUMA node of the NICs it drives. Posting and reaping
+    // touch NIC doorbells, CQs and request state on every op; a remote-socket thread pays
+    // cross-socket latency on each of them. Disable with NIXL_LIBFABRIC_PT_NUMA_BIND=0.
+    size_t pt_numa_bind = 1;
+    LibfabricUtils::getCustomIntParam(getCustomParams(), "pt_numa_bind", pt_numa_bind);
+    bool numa_bind_done = (pt_numa_bind == 0);
     // Main progress loop - continuously process completions only on rails
     while (!progress_thread_stop_.load()) {
+        if (!numa_bind_done) {
+            numa_bind_done = rail_manager_.bindThreadToActiveRailNuma();
+        }
         // Process completions only on rails (non-blocking)
         bool any_completions = false;
         nixl_status_t status = rail_manager_.progressActiveRails();

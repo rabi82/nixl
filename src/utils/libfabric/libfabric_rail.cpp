@@ -1374,6 +1374,11 @@ nixlLibfabricRail::enqueuePost(const nixlLibfabricPostRequest &req) {
     post_ring_.push(req);
 }
 
+void
+nixlLibfabricRail::enqueuePosts(const nixlLibfabricPostRequest *reqs, size_t count) {
+    post_ring_.pushBatch(reqs, count);
+}
+
 nixl_status_t
 nixlLibfabricRail::drainPostQueue() {
     nixlLibfabricPostRequest pr;

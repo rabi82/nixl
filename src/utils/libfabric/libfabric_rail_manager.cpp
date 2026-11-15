@@ -27,6 +27,8 @@
 #include <numaif.h>
 
 #include <numa.h>
+#include <pthread.h>
+#include <sched.h>
 
 // Forward declaration for LibfabricUtils namespace
 namespace LibfabricUtils {
@@ -401,6 +403,12 @@ nixlLibfabricRailManager::reserveBaseOffset() {
     return round_robin_counter.fetch_add(1);
 }
 
+namespace {
+// Defined with the per-thread post staging below.
+inline void
+stagePost(nixlLibfabricRail *rail, const nixlLibfabricPostRequest &pr);
+} // namespace
+
 nixl_status_t
 nixlLibfabricRailManager::prepareAndSubmitTransfer(
     nixlLibfabricReq::OpType op_type,
@@ -664,7 +672,7 @@ nixlLibfabricRailManager::deferTransferRequest(nixlLibfabricReq::OpType op_type,
     pr.fi_flags = fi_flags;
     pr.device_id = device_id;
     pr.is_cuda_vram = is_cuda_vram;
-    rails_[rail_id]->enqueuePost(pr);
+    stagePost(rails_[rail_id].get(), pr);
 }
 
 bool
@@ -1389,6 +1397,118 @@ nixlLibfabricRailManager::deserializeRailEndpoints(
 
     NIXL_DEBUG << "Successfully deserialized " << num_rails << " rail endpoints.";
     return NIXL_SUCCESS;
+}
+
+namespace {
+// Posts staged per rail by the calling thread before they go to the rail's MPSC ring in one
+// reservation. Keeps the producer from bouncing the ring's head cache line on every op.
+constexpr size_t kPostStageSize = 64;
+
+struct PostStage {
+    nixlLibfabricRail *rail = nullptr;
+    size_t count = 0;
+    nixlLibfabricPostRequest buf[kPostStageSize];
+};
+
+thread_local std::vector<PostStage> tl_post_stages;
+
+inline void
+stagePost(nixlLibfabricRail *rail, const nixlLibfabricPostRequest &pr) {
+    PostStage *stage = nullptr;
+    for (auto &s : tl_post_stages) {
+        if (s.rail == rail) {
+            stage = &s;
+            break;
+        }
+    }
+    if (!stage) {
+        tl_post_stages.emplace_back();
+        stage = &tl_post_stages.back();
+        stage->rail = rail;
+    }
+    stage->buf[stage->count++] = pr;
+    if (stage->count == kPostStageSize) {
+        rail->enqueuePosts(stage->buf, stage->count);
+        stage->count = 0;
+    }
+}
+} // namespace
+
+void
+nixlLibfabricRailManager::flushDeferredPosts() {
+    for (auto &s : tl_post_stages) {
+        if (s.count) {
+            s.rail->enqueuePosts(s.buf, s.count);
+            s.count = 0;
+        }
+    }
+}
+
+bool
+nixlLibfabricRailManager::bindThreadToActiveRailNuma() {
+    size_t rail_id = SIZE_MAX;
+    {
+        std::lock_guard<std::mutex> lock(active_rails_mutex_);
+        for (const auto &[id, refcount] : active_rails_) {
+            if (refcount > 0 && id < rails_.size()) {
+                rail_id = id;
+                break;
+            }
+        }
+    }
+    if (rail_id == SIZE_MAX) {
+        return false; // nothing registered yet, retry later
+    }
+    if (!topology || numa_available() < 0) {
+        return true;
+    }
+
+    const uint16_t node = topology->getDeviceNumaNode(rails_[rail_id]->device_name);
+    if (node == nixlLibfabricTopology::INVALID_NUMA_NODE_ID) {
+        NIXL_DEBUG << "PT NUMA bind: no NUMA node for " << rails_[rail_id]->device_name;
+        return true;
+    }
+
+    struct bitmask *node_cpus = numa_allocate_cpumask();
+    if (!node_cpus) {
+        return true;
+    }
+    if (numa_node_to_cpus(node, node_cpus) != 0) {
+        numa_free_cpumask(node_cpus);
+        return true;
+    }
+
+    cpu_set_t current;
+    CPU_ZERO(&current);
+    if (pthread_getaffinity_np(pthread_self(), sizeof(current), &current) != 0) {
+        numa_free_cpumask(node_cpus);
+        return true;
+    }
+
+    // Only narrow the existing affinity: never move the thread to CPUs it was not allowed on.
+    cpu_set_t wanted;
+    CPU_ZERO(&wanted);
+    size_t count = 0;
+    for (unsigned int cpu = 0; cpu < node_cpus->size && cpu < CPU_SETSIZE; ++cpu) {
+        if (numa_bitmask_isbitset(node_cpus, cpu) && CPU_ISSET(cpu, &current)) {
+            CPU_SET(cpu, &wanted);
+            ++count;
+        }
+    }
+    numa_free_cpumask(node_cpus);
+
+    if (count == 0) {
+        NIXL_INFO << "PT NUMA bind: thread affinity has no CPU on NUMA node " << node
+                  << " of rail " << rails_[rail_id]->device_name << "; keeping current affinity";
+        return true;
+    }
+    if (pthread_setaffinity_np(pthread_self(), sizeof(wanted), &wanted) != 0) {
+        NIXL_WARN << "PT NUMA bind: pthread_setaffinity_np failed for NUMA node " << node;
+        return true;
+    }
+    NIXL_INFO << "Progress thread bound to " << count << " CPUs of NUMA node " << node
+              << " (rail " << rails_[rail_id]->device_name << ")";
+    return true;
 }
 
 void

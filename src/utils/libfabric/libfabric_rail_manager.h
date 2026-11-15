@@ -80,6 +80,23 @@ public:
      */
     nixlLibfabricRailManager(size_t striping_threshold);
 
+    /**
+     * @brief Restrict the calling thread to the CPUs of the NUMA node that hosts the active
+     * data rails (the EFA devices memory was registered on).
+     * Keeps the thread's existing affinity if it has no CPU on that node.
+     * @return True once a decision was made (bound or deliberately skipped); false if no data
+     * rail is active yet, so the caller can retry later.
+     */
+    bool
+    bindThreadToActiveRailNuma();
+
+    /**
+     * @brief Hand all post requests this thread staged by deferTransferRequest() to the
+     * progress thread. Must be called before the caller returns from a post call.
+     */
+    static void
+    flushDeferredPosts();
+
     /** Update the size at or above which a transfer is striped across rails. */
     void
     setStripingThreshold(size_t striping_threshold) {

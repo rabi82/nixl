@@ -312,6 +312,7 @@ public:
         capacity_ = 0;
         head_ = 0;
         tail_ = 0;
+        cached_head_ = 0;
     }
 
     void
@@ -339,12 +340,39 @@ public:
         committed_[head].store(true, std::memory_order_release);
     }
 
+    /**
+     * @brief Push @p n items with one head reservation. Same blocking rules as push(), but
+     * the shared head counter is touched once per batch instead of once per item.
+     */
+    void
+    pushBatch(const T *items, size_t n) {
+        if (n == 0) {
+            return;
+        }
+        size_t absHead = head_.fetch_add(n, std::memory_order_relaxed);
+        size_t absTail = tail_.load(std::memory_order_acquire);
+        for (size_t i = 0; i < n; ++i) {
+            const size_t slot = absHead + i;
+            while (slot - absTail >= capacity_) {
+                std::this_thread::yield();
+                absTail = tail_.load(std::memory_order_acquire);
+            }
+            const size_t idx = slot % capacity_;
+            ring_[idx] = items[i];
+            committed_[idx].store(true, std::memory_order_release);
+        }
+    }
+
     bool
     pop(T &item) {
         size_t absTail = tail_.load(std::memory_order_relaxed);
-        size_t absHead = head_.load(std::memory_order_acquire);
-        if (absTail == absHead) {
-            return false;
+        // Consumer-side copy of head: re-read the shared counter only when the cached
+        // window is used up, so producers keep that cache line most of the time.
+        if (absTail == cached_head_) {
+            cached_head_ = head_.load(std::memory_order_acquire);
+            if (absTail == cached_head_) {
+                return false;
+            }
         }
         size_t tail = absTail % capacity_;
         // Wait for the slot to be committed (producer might still be writing)
@@ -376,6 +404,7 @@ public:
 private:
     alignas(64) std::atomic<size_t> head_;
     alignas(64) std::atomic<size_t> tail_;
+    size_t cached_head_ = 0; ///< consumer-only snapshot of head_
     size_t capacity_;
     T *ring_;
     std::atomic<bool> *committed_;
@@ -525,6 +554,10 @@ public:
     /** Enqueue a post request for the progress thread to execute */
     void
     enqueuePost(const nixlLibfabricPostRequest &req);
+
+    /** Enqueue several post requests with one ring reservation (PT-owns-endpoint mode). */
+    void
+    enqueuePosts(const nixlLibfabricPostRequest *reqs, size_t count);
 
     /** Drain pending posts (called by progress thread) */
     nixl_status_t
