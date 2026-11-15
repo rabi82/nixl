@@ -247,7 +247,9 @@ public:
                              size_t base_offset,
                              bool apply_fi_more = false,
                              int device_id = -1,
-                             bool is_cuda_vram = false);
+                             bool is_cuda_vram = false,
+                             void *completion_owner = nullptr,
+                             nixlLibfabricBatchCompleteFn completion_fn = nullptr);
 
     void
     deferTransferRequest(nixlLibfabricReq::OpType op_type,

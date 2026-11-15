@@ -154,6 +154,14 @@ public:
     void
     complete_request(nixl_status_t status);
 
+    /** Record @p count completions with one status, using one atomic update per counter. */
+    void
+    complete_requests(nixl_status_t status, size_t count);
+
+    /** nixlLibfabricBatchCompleteFn adapter; @p owner is a nixlLibfabricBackendH. */
+    static void
+    batchComplete(void *owner, nixl_status_t status, size_t count);
+
     /** Get current count of requests completed as part of this transfer */
     size_t
     get_completed_requests_count() const;

@@ -57,6 +57,8 @@ struct nixlLibfabricReq {
     size_t chunk_offset; ///< Chunk offset for DATA requests
     size_t chunk_size; ///< Chunk size for DATA requests
     std::function<void(nixl_status_t)> completion_callback; ///< Completion callback function
+    void *completion_owner = nullptr; ///< Owner passed to completion_fn (batched path)
+    nixlLibfabricBatchCompleteFn completion_fn = nullptr; ///< Batched completion, if set
     void *local_addr; ///< Local memory address for transfers
     uint64_t remote_addr; ///< Remote memory address for transfers
     struct fid_mr *local_mr; ///< Local memory registration for transfers
@@ -134,7 +136,7 @@ protected:
     mutable std::stack<size_t> free_indices_; ///< Stack of available request indices
     size_t rail_id_; ///< Rail ID for this pool
     size_t initial_pool_size_; ///< Original pool size for expansion calculations
-    mutable std::mutex pool_mutex_; ///< Thread safety protection
+    mutable nixlLibfabricSpinLock pool_mutex_; ///< Thread safety protection (short sections)
 };
 
 /** Buffer chunk structure for control request pool */

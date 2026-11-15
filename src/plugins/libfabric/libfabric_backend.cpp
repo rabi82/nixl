@@ -437,6 +437,24 @@ nixlLibfabricBackendH::complete_request(nixl_status_t status) {
                << "/" << submitted_requests_.load(std::memory_order_relaxed);
 }
 
+void
+nixlLibfabricBackendH::complete_requests(nixl_status_t status, size_t count) {
+    if (status != NIXL_SUCCESS) {
+        nixl_status_t expected = NIXL_SUCCESS;
+        error_status_.compare_exchange_strong(
+            expected, status, std::memory_order_relaxed, std::memory_order_relaxed);
+    } else {
+        successful_requests_.fetch_add(count, std::memory_order_relaxed);
+    }
+    // Release pairs with the acquire load in is_completed().
+    completed_requests_.fetch_add(count, std::memory_order_release);
+}
+
+void
+nixlLibfabricBackendH::batchComplete(void *owner, nixl_status_t status, size_t count) {
+    static_cast<nixlLibfabricBackendH *>(owner)->complete_requests(status, count);
+}
+
 size_t
 nixlLibfabricBackendH::get_completed_requests_count() const {
     return completed_requests_.load();
@@ -1439,15 +1457,15 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
             remote_md->remote_selected_endpoints_,
             conn->rail_remote_addr_list_,
             backend_handle->post_xfer_id,
-            [backend_handle](nixl_status_t status) {
-                backend_handle->complete_request(status);
-            }, // Completion callback
+            nullptr, // completions go through the batched path below
             desc_submitted_count,
             desc_idx,
             xfer_base_offset,
             apply_fi_more,
             local[desc_idx].devId,
-            is_cuda_vram);
+            is_cuda_vram,
+            backend_handle,
+            &nixlLibfabricBackendH::batchComplete);
 
         if (status != NIXL_SUCCESS) {
             NIXL_ERROR << "prepareAndSubmitTransfer failed for descriptor " << desc_idx

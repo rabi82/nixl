@@ -24,6 +24,10 @@
 #include <unordered_map>
 #include <cstring>
 #include <cassert>
+#include <atomic>
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
 
 #include "nixl.h"
 
@@ -115,6 +119,48 @@ constexpr const char *NIXL_HANDSHAKE_TAG_CONN = "conn";
      (((uint64_t)(seq_id) & NIXL_SEQ_ID_MASK) << NIXL_SEQ_ID_SHIFT))
 
 #define NIXL_LIBFABRIC_CQ_BATCH_SIZE 64
+
+/**
+ * @brief Batched completion callback for data requests.
+ * Called with the owner pointer, a status and the number of requests it covers.
+ * Lets the CQ reaper publish many completions of one transfer with one atomic update.
+ */
+using nixlLibfabricBatchCompleteFn = void (*)(void *owner, nixl_status_t status, size_t count);
+
+/**
+ * @brief Test-and-test-and-set spin lock for very short critical sections that two threads
+ * hit on every operation (request alloc in postXfer, release in the progress thread).
+ * Avoids futex sleep/wake on contention. Satisfies BasicLockable.
+ */
+class nixlLibfabricSpinLock {
+public:
+    void
+    lock() noexcept {
+        while (flag_.exchange(true, std::memory_order_acquire)) {
+            while (flag_.load(std::memory_order_relaxed)) {
+#if defined(__x86_64__) || defined(__i386__)
+                _mm_pause();
+#elif defined(__aarch64__)
+                asm volatile("yield" ::: "memory");
+#endif
+            }
+        }
+    }
+
+    bool
+    try_lock() noexcept {
+        return !flag_.load(std::memory_order_relaxed) &&
+            !flag_.exchange(true, std::memory_order_acquire);
+    }
+
+    void
+    unlock() noexcept {
+        flag_.store(false, std::memory_order_release);
+    }
+
+private:
+    std::atomic<bool> flag_{false};
+};
 
 // Giga (decimal) constant
 constexpr inline uint64_t NIXL_LIBFABRIC_GIGA = 1000ull * 1000ull * 1000ull;

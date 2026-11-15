@@ -85,6 +85,55 @@ RequestPool::initializeBasePool(size_t pool_size) {
                << " Free requests: " << free_indices_.size();
 }
 
+
+namespace {
+// Per-thread accumulator for successful data-request completions. Consecutive completions with
+// the same owner fold into one completion_fn call. Flushed at the end of every CQ batch, so
+// nothing stays pending once the reaping call returns.
+struct CompletionBatch {
+    void *owner = nullptr;
+    nixlLibfabricBatchCompleteFn fn = nullptr;
+    size_t count = 0;
+
+    void
+    flush() {
+        if (count) {
+            fn(owner, NIXL_SUCCESS, count);
+            count = 0;
+        }
+    }
+};
+
+thread_local CompletionBatch tl_completion_batch;
+
+// Report one request's outcome to its owner. Successful batched requests are accumulated;
+// errors flush pending successes first, then report immediately.
+inline void
+notifyRequestCompletion(nixlLibfabricReq *req, nixl_status_t status) {
+    if (req->completion_fn) {
+        CompletionBatch &b = tl_completion_batch;
+        if (status == NIXL_SUCCESS) {
+            if (b.count && (b.owner != req->completion_owner || b.fn != req->completion_fn)) {
+                b.flush();
+            }
+            b.owner = req->completion_owner;
+            b.fn = req->completion_fn;
+            ++b.count;
+            return;
+        }
+        b.flush();
+        req->completion_fn(req->completion_owner, status, 1);
+    } else if (req->completion_callback) {
+        req->completion_callback(status);
+    }
+}
+
+inline void
+flushRequestCompletions() {
+    tl_completion_batch.flush();
+}
+} // namespace
+
 void
 RequestPool::release(nixlLibfabricReq *req) const {
     if (!req) {
@@ -92,7 +141,7 @@ RequestPool::release(nixlLibfabricReq *req) const {
         return;
     }
 
-    std::lock_guard<std::mutex> lock(pool_mutex_);
+    std::lock_guard<nixlLibfabricSpinLock> lock(pool_mutex_);
 
     // GUARD: Check if already released
     if (!req->in_use) {
@@ -109,6 +158,8 @@ RequestPool::release(nixlLibfabricReq *req) const {
     req->chunk_offset = 0;
     req->chunk_size = 0;
     req->completion_callback = nullptr;
+    req->completion_owner = nullptr;
+    req->completion_fn = nullptr;
     memset(&req->ctx, 0, sizeof(fi_context));
 
     // Use pool_index instead of pointer arithmetic for deque compatibility
@@ -126,7 +177,7 @@ RequestPool::release(nixlLibfabricReq *req) const {
 
 nixlLibfabricReq *
 RequestPool::findByContext(void *context) const {
-    std::lock_guard<std::mutex> lock(pool_mutex_);
+    std::lock_guard<nixlLibfabricSpinLock> lock(pool_mutex_);
 
     if (!context) {
         return nullptr;
@@ -142,19 +193,19 @@ RequestPool::findByContext(void *context) const {
 
 size_t
 RequestPool::getActiveRequestCount() const {
-    std::lock_guard<std::mutex> lock(pool_mutex_);
+    std::lock_guard<nixlLibfabricSpinLock> lock(pool_mutex_);
     return requests_.size() - free_indices_.size();
 }
 
 size_t
 RequestPool::getPoolUtilization() const {
-    std::lock_guard<std::mutex> lock(pool_mutex_);
+    std::lock_guard<nixlLibfabricSpinLock> lock(pool_mutex_);
     return ((requests_.size() - free_indices_.size()) * 100) / requests_.size();
 }
 
 nixlLibfabricReq *
 RequestPool::allocateReq(uint32_t req_id) {
-    std::lock_guard<std::mutex> lock(pool_mutex_);
+    std::lock_guard<nixlLibfabricSpinLock> lock(pool_mutex_);
 
     if (free_indices_.empty()) {
         size_t old_size = requests_.size();
@@ -858,9 +909,8 @@ nixlLibfabricRail::progressCompletionQueue() {
             if (err_entry.op_context) {
                 nixlLibfabricReq *req = findRequestFromContext(err_entry.op_context);
                 if (req && req->in_use) {
-                    if (req->completion_callback) {
-                        req->completion_callback(NIXL_ERR_BACKEND);
-                    }
+                    flushRequestCompletions();
+                    notifyRequestCompletion(req, NIXL_ERR_BACKEND);
                     releaseRequest(req);
                 }
             }
@@ -890,6 +940,7 @@ nixlLibfabricRail::progressCompletionQueue() {
             }
         }
 
+        flushRequestCompletions();
         if (first_error != NIXL_SUCCESS) {
             return first_error;
         }
@@ -926,6 +977,7 @@ nixlLibfabricRail::pollForCompletions() {
         for (int c = 0; c < cq_ret; c++) {
             processCompletionQueueEntry(&cq_buf[c], src_addrs[c]);
         }
+        flushRequestCompletions();
     } else if (cq_ret < 0 && cq_ret != -FI_EAGAIN) {
         NIXL_ERROR << "CQ error in drain interleave on rail " << rail_id << ": "
                    << fi_strerror(err_entry.err);
@@ -1035,12 +1087,8 @@ nixlLibfabricRail::processLocalTransferCompletion(struct fi_cq_data_entry *comp,
     nixlLibfabricReq *req = findRequestFromContext(comp->op_context);
     if (req && req->in_use) { // Only process if request is still valid and in use
         // Call completion callback if it exists
-        if (req->completion_callback) {
-            NIXL_TRACE << "Calling completion callback for " << operation_type << " request "
-                       << req->xfer_id;
-            req->completion_callback(NIXL_SUCCESS);
-            NIXL_TRACE << "Completion callback completed for " << operation_type;
-        }
+        NIXL_TRACE << "Completing " << operation_type << " request " << req->xfer_id;
+        notifyRequestCompletion(req, NIXL_SUCCESS);
         releaseRequest(req);
     } else if (req && !req->in_use) {
         NIXL_WARN << "Completion received for already released " << operation_type << " request "
@@ -1350,8 +1398,8 @@ nixlLibfabricRail::drainPostQueue() {
             if (status != NIXL_SUCCESS) {
                 // completion is notified also for failed requests
                 // (otherwise counters would never match)
-                if (pr.req && pr.req->completion_callback) {
-                    pr.req->completion_callback(status);
+                if (pr.req) {
+                    notifyRequestCompletion(pr.req, status);
                 }
                 if (pr.req) {
                     releaseRequest(pr.req);
@@ -1368,8 +1416,8 @@ nixlLibfabricRail::drainPostQueue() {
                 if (cuda_ret != cudaSuccess) {
                     // completion is notified also for failed requests
                     // (otherwise counters would never match)
-                    if (pr.req && pr.req->completion_callback) {
-                        pr.req->completion_callback(NIXL_ERR_BACKEND);
+                    if (pr.req) {
+                        notifyRequestCompletion(pr.req, NIXL_ERR_BACKEND);
                     }
                     if (pr.req) {
                         releaseRequest(pr.req);
@@ -1442,10 +1490,10 @@ nixlLibfabricRail::drainPostQueue() {
         if (ret != 0) {
             NIXL_ERROR << "drainPostQueue: post failed ret=" << ret << " (" << fi_strerror(-ret)
                        << ") on rail " << rail_id;
-            if (pr.req && pr.req->completion_callback) {
+            if (pr.req) {
                 // completion is notified also for failed requests
                 // (otherwise counters would never match)
-                pr.req->completion_callback(NIXL_ERR_BACKEND);
+                notifyRequestCompletion(pr.req, NIXL_ERR_BACKEND);
             }
             if (pr.req) {
                 releaseRequest(pr.req);
@@ -1458,6 +1506,7 @@ nixlLibfabricRail::drainPostQueue() {
         }
     }
 
+    flushRequestCompletions();
     return NIXL_SUCCESS;
 }
 

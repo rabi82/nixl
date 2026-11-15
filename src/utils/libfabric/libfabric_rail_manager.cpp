@@ -420,7 +420,9 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
     size_t base_offset,
     bool apply_fi_more,
     int device_id,
-    bool is_cuda_vram) {
+    bool is_cuda_vram,
+    void *completion_owner,
+    nixlLibfabricBatchCompleteFn completion_fn) {
     // Initialize output parameter
     submitted_count_out = 0;
 
@@ -454,7 +456,12 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
             return NIXL_ERR_BACKEND;
         }
         // Set completion callback and populate request
-        req->completion_callback = completion_callback;
+        if (completion_fn) {
+            req->completion_owner = completion_owner;
+            req->completion_fn = completion_fn;
+        } else {
+            req->completion_callback = completion_callback;
+        }
         req->chunk_offset = 0;
         req->chunk_size = transfer_size;
         req->local_addr = local_addr;
@@ -546,7 +553,12 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
                 return NIXL_ERR_BACKEND;
             }
 
-            req->completion_callback = completion_callback;
+            if (completion_fn) {
+                req->completion_owner = completion_owner;
+                req->completion_fn = completion_fn;
+            } else {
+                req->completion_callback = completion_callback;
+            }
 
             // Calculate and populate chunk info
             size_t chunk_offset = i * chunk_size;
