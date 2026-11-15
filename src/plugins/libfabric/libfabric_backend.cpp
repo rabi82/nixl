@@ -2132,8 +2132,9 @@ nixlLibfabricEngine::progressThread() {
     LibfabricUtils::getCustomIntParam(getCustomParams(), "pt_numa_bind", pt_numa_bind);
     bool numa_bind_done = (pt_numa_bind == 0);
     // Optional: one dedicated progress thread per data rail. This thread keeps rail 0
-    // (control/notifications) and any rail not handed off. Off by default.
-    size_t pt_per_rail = 0;
+    // (control/notifications) and any rail not handed off. On by default; costs one spinning
+    // CPU thread per data rail. Disable with NIXL_LIBFABRIC_PT_PER_RAIL=0.
+    size_t pt_per_rail = 1;
     LibfabricUtils::getCustomIntParam(getCustomParams(), "pt_per_rail", pt_per_rail);
     uint64_t seen_rail_gen = 0;
     std::vector<size_t> active_data_rails;

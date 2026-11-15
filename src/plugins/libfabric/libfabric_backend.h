@@ -230,7 +230,7 @@ private:
 
     // Progress thread for rail CQs
     std::thread progress_thread_;
-    /** Dedicated per-rail progress threads (NIXL_LIBFABRIC_PT_PER_RAIL=1). */
+    /** Dedicated per-rail progress threads (default on; NIXL_LIBFABRIC_PT_PER_RAIL=0 disables). */
     std::vector<std::thread> rail_progress_threads_;
     std::atomic<bool> progress_thread_stop_;
 
