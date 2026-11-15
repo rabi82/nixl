@@ -22,6 +22,7 @@
 #include "common/nixl_log.h"
 #include "serdes/serdes.h"
 #include <sstream>
+#include <cstdlib>
 #include <algorithm>
 #include <cctype>
 #include <numaif.h>
@@ -1411,6 +1412,7 @@ constexpr size_t kPostStageSize = 64;
 struct PostStage {
     nixlLibfabricRail *rail = nullptr;
     size_t count = 0;
+    size_t bytes = 0;
     nixlLibfabricPostRequest buf[kPostStageSize];
 };
 
@@ -1431,9 +1433,18 @@ stagePost(nixlLibfabricRail *rail, const nixlLibfabricPostRequest &pr) {
         stage->rail = rail;
     }
     stage->buf[stage->count++] = pr;
-    if (stage->count == kPostStageSize) {
+    stage->bytes += pr.length;
+    // Staging only pays for many small ops. Large ops go to the progress thread at once
+    // (byte cap), so the NIC starts on them without waiting for the stage to fill.
+    // 16 KiB ops still batch 64 per push. NIXL_LIBFABRIC_POST_STAGE_BYTES overrides.
+    static const size_t stage_bytes = [] {
+        const char *e = std::getenv("NIXL_LIBFABRIC_POST_STAGE_BYTES");
+        return e ? std::strtoull(e, nullptr, 10) : size_t(1) << 20;
+    }();
+    if (stage->count == kPostStageSize || stage->bytes >= stage_bytes) {
         rail->enqueuePosts(stage->buf, stage->count);
         stage->count = 0;
+        stage->bytes = 0;
     }
 }
 } // namespace
@@ -1444,6 +1455,7 @@ nixlLibfabricRailManager::flushDeferredPosts() {
         if (s.count) {
             s.rail->enqueuePosts(s.buf, s.count);
             s.count = 0;
+            s.bytes = 0;
         }
     }
 }
