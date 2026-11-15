@@ -26,6 +26,7 @@
 #endif
 
 #include <cstring>
+#include <cstdlib>
 #include <stdexcept>
 #include <stack>
 
@@ -1389,6 +1390,16 @@ nixlLibfabricRail::drainPostQueue() {
     int current_cuda_device = -1;
 #endif
 
+    // The EP lock is held across a FI_MORE group and released after the post that rings the
+    // doorbell. Taking it costs a locked instruction, which also drains the write-combining
+    // buffer holding the WQE just copied; once per group instead of once per post.
+    // NIXL_LIBFABRIC_PT_GROUP_EP_LOCK=0 restores one lock per post.
+    static const bool group_ep_lock = [] {
+        const char *e = std::getenv("NIXL_LIBFABRIC_PT_GROUP_EP_LOCK");
+        return !(e && std::string(e) == "0");
+    }();
+    std::unique_lock<nixlLibfabricSpinLock> ep_lock(ep_mutex_, std::defer_lock);
+
     // drain the queue up to configured limit,
     // to ensure requests from other rails do not wait too much time
     size_t post_req_count = 0;
@@ -1470,7 +1481,9 @@ nixlLibfabricRail::drainPostQueue() {
                 msg.context = &pr.req->ctx;
                 msg.data = pr.immediate_data;
 
-                const std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
+                if (!ep_lock.owns_lock()) {
+                    ep_lock.lock();
+                }
                 ret = fi_writemsg(endpoint, &msg, pr.fi_flags | FI_REMOTE_CQ_DATA);
             } else {
                 struct iovec iov{};
@@ -1492,10 +1505,17 @@ nixlLibfabricRail::drainPostQueue() {
                 msg.rma_iov_count = 1;
                 msg.context = &pr.req->ctx;
 
-                const std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
+                if (!ep_lock.owns_lock()) {
+                    ep_lock.lock();
+                }
                 ret = fi_readmsg(endpoint, &msg, pr.fi_flags);
             }
 
+            // Release after the doorbell post (no FI_MORE), on any error, or always when
+            // grouping is disabled. pollForCompletions() takes the lock itself.
+            if (ret != 0 || !group_ep_lock || !(pr.fi_flags & FI_MORE)) {
+                ep_lock.unlock();
+            }
             if (ret == -FI_EAGAIN) {
                 pollForCompletions();
             }
@@ -1515,9 +1535,12 @@ nixlLibfabricRail::drainPostQueue() {
             continue;
         }
         posted++;
-        if (posted % POST_POLL_INTERLEAVE_RATIO == 0) {
+        if (posted % POST_POLL_INTERLEAVE_RATIO == 0 && !ep_lock.owns_lock()) {
             pollForCompletions();
         }
+    }
+    if (ep_lock.owns_lock()) {
+        ep_lock.unlock();
     }
 
     flushRequestCompletions();
