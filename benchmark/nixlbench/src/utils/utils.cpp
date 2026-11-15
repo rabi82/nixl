@@ -185,6 +185,9 @@ NB_ARG_INT32(num_threads,
 NB_ARG_INT32(num_initiator_dev, 1, "Number of device in initiator process");
 NB_ARG_INT32(num_target_dev, 1, "Number of device in target process");
 NB_ARG_BOOL(enable_pt, false, "Enable Progress Thread (only used with nixl worker)");
+NB_ARG_BOOL(numa_bind,
+            true,
+            "Bind each pairwise SG VRAM worker to the CPUs of its GPU's NUMA node (nixl worker)");
 NB_ARG_UINT64(progress_threads, 0, "Number of progress threads");
 NB_ARG_BOOL(enable_vmm, false, "Enable VMM memory allocation for VRAM buffers");
 NB_ARG_BOOL(vmm_gdr_capable, true, "Set gpuDirectRDMACapable for non-localized VMM allocations");
@@ -389,6 +392,7 @@ int xferBenchConfig::large_blk_iter_ftr = 16;
 int xferBenchConfig::warmup_iter = 0;
 int xferBenchConfig::num_threads = 0;
 bool xferBenchConfig::enable_pt = false;
+bool xferBenchConfig::numa_bind = true;
 size_t xferBenchConfig::progress_threads = 0;
 bool xferBenchConfig::enable_vmm = false;
 bool xferBenchConfig::vmm_gdr_capable = true;
@@ -668,6 +672,7 @@ xferBenchConfig::loadParams(void) {
         // before the real agent is created (the worker later refreshes from the engine).
         backend_mems = discoverPluginMems(backend);
         enable_pt = NB_ARG(enable_pt);
+        numa_bind = NB_ARG(numa_bind);
         progress_threads = NB_ARG(progress_threads);
         device_list = NB_ARG(device_list);
         enable_vmm = NB_ARG(enable_vmm);
@@ -1104,6 +1109,7 @@ xferBenchConfig::printConfig() {
             "DOCA_MEMOS])",
             backend);
         printOption("Enable pt (--enable_pt=[0,1])", std::to_string(enable_pt));
+        printOption("NUMA bind to GPU node (--numa_bind=[0,1])", std::to_string(numa_bind));
         printOption("Progress threads (--progress_threads=N)", std::to_string(progress_threads));
         printOption("Device list (--device_list=dev1,dev2,...)", device_list);
         printOption("Enable VMM (--enable_vmm=[0,1])", std::to_string(enable_vmm));

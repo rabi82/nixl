@@ -191,6 +191,7 @@ public:
     static int warmup_iter;
     static int num_threads;
     static bool enable_pt;
+    static bool numa_bind;
     static size_t progress_threads;
     static std::string device_list;
     static std::string etcd_endpoints;

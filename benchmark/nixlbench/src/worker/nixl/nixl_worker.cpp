@@ -22,6 +22,8 @@
 #include <chrono>
 #include <cstring>
 #include <fcntl.h>
+#include <fstream>
+#include <sched.h>
 #include <filesystem>
 #include <iomanip>
 #include "kernels/nixlbench_device_launch.cuh"
@@ -59,6 +61,59 @@ resolveVramSegment() {
     std::exit(EXIT_FAILURE);
 #endif
 }
+
+#if HAVE_CUDA
+// Restrict the calling thread (and threads it creates later, such as the NIXL progress thread
+// and OpenMP workers) to the CPUs of the NUMA node that hosts CUDA device @p devid. Only
+// narrows the current affinity, so an outer numactl/taskset still wins. Best effort.
+static void
+bindToGpuNumaNode(int devid) {
+    char bus_id[32] = {};
+    if (cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), devid) != cudaSuccess) {
+        return;
+    }
+    std::string pci(bus_id);
+    std::transform(pci.begin(), pci.end(), pci.begin(), ::tolower);
+
+    std::ifstream numa_file("/sys/bus/pci/devices/" + pci + "/numa_node");
+    int node = -1;
+    if (!(numa_file >> node) || node < 0) {
+        return;
+    }
+    std::ifstream cpulist_file("/sys/devices/system/node/node" + std::to_string(node) +
+                               "/cpulist");
+    std::string cpulist;
+    if (!std::getline(cpulist_file, cpulist)) {
+        return;
+    }
+
+    cpu_set_t current;
+    CPU_ZERO(&current);
+    if (sched_getaffinity(0, sizeof(current), &current) != 0) {
+        return;
+    }
+    cpu_set_t wanted;
+    CPU_ZERO(&wanted);
+    int count = 0;
+    std::stringstream ss(cpulist);
+    std::string range;
+    while (std::getline(ss, range, ',')) {
+        const size_t dash = range.find('-');
+        const int lo = std::stoi(range.substr(0, dash));
+        const int hi = (dash == std::string::npos) ? lo : std::stoi(range.substr(dash + 1));
+        for (int cpu = lo; cpu <= hi && cpu < CPU_SETSIZE; ++cpu) {
+            if (CPU_ISSET(cpu, &current)) {
+                CPU_SET(cpu, &wanted);
+                ++count;
+            }
+        }
+    }
+    if (count > 0 && sched_setaffinity(0, sizeof(wanted), &wanted) == 0) {
+        std::cout << "NUMA bind: GPU " << devid << " (" << pci << ") -> node " << node << ", "
+                  << count << " CPUs" << std::endl;
+    }
+}
+#endif
 
 #define GET_SEG_TYPE(is_initiator)                                                          \
     ({                                                                                      \
@@ -136,6 +191,15 @@ xferBenchNixlWorker::xferBenchNixlWorker(const std::vector<std::string> &devices
     std::vector<nixl_backend_t> plugins;
 
     rank = rt->getRank();
+
+#if HAVE_CUDA
+    // In pairwise SG each process drives one GPU. Run it, and the progress thread it is about
+    // to create, next to that GPU and its NICs.
+    if (xferBenchConfig::numa_bind && seg_type == VRAM_SEG && IS_PAIRWISE_AND_SG()) {
+        const int devid = isInitiator() ? rank : rank - xferBenchConfig::num_initiator_dev;
+        bindToGpuNumaNode(devid);
+    }
+#endif
 
     nixlAgentConfig dev_meta;
     dev_meta.useProgThread = enable_pt;
