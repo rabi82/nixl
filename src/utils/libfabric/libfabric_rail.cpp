@@ -1323,6 +1323,7 @@ nixlLibfabricRail::drainPostQueue() {
     int posted = 0;
 #if HAVE_CUDA
     bool use_cuda_addr_wa = false;
+    bool cuda_ctx_applied = false;
     int current_cuda_device = -1;
 #endif
 
@@ -1338,8 +1339,14 @@ nixlLibfabricRail::drainPostQueue() {
             // NOTE: for now we do not call engine to try to set context in work-around mode - this
             // is postponsed to another PR, which requires substantial refactoring - instead we
             // directly call cudaSetDevice() when needed
-            use_cuda_addr_wa = false;
-            nixl_status_t status = LibfabricUtils::cudaSetCtx(use_cuda_addr_wa);
+            // The context is per thread and does not change between posts in one drain call,
+            // so apply it once per call instead of once per posted descriptor.
+            nixl_status_t status = NIXL_SUCCESS;
+            if (!cuda_ctx_applied) {
+                use_cuda_addr_wa = false;
+                status = LibfabricUtils::cudaSetCtx(use_cuda_addr_wa);
+                cuda_ctx_applied = (status == NIXL_SUCCESS);
+            }
             if (status != NIXL_SUCCESS) {
                 // completion is notified also for failed requests
                 // (otherwise counters would never match)
@@ -2043,18 +2050,9 @@ nixlLibfabricRail::findRequestFromContext(void *context) const {
         NIXL_ERROR << "Null context provided to findRequestFromContext on rail " << rail_id;
         return nullptr;
     }
-    // Try control pool first
-    nixlLibfabricReq *req = control_request_pool_.findByContext(context);
-    if (req) {
-        return req;
-    }
-    // Try data pool
-    req = data_request_pool_.findByContext(context);
-    if (req) {
-        return req;
-    }
-    NIXL_ERROR << "No request found for context " << context << " on rail " << rail_id;
-    return nullptr;
+    // fi_context is the first member of nixlLibfabricReq for both control and data pools,
+    // so the context pointer is the request pointer. No pool lookup or lock is needed.
+    return reinterpret_cast<nixlLibfabricReq *>(context);
 }
 
 fi_info *

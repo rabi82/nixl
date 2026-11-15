@@ -79,6 +79,12 @@ public:
      * @throws std::runtime_error if initialization fails
      */
     nixlLibfabricRailManager(size_t striping_threshold);
+
+    /** Update the size at or above which a transfer is striped across rails. */
+    void
+    setStripingThreshold(size_t striping_threshold) {
+        striping_threshold_ = striping_threshold;
+    }
     /** Destroy rail manager and cleanup all resources */
     ~nixlLibfabricRailManager();
 
