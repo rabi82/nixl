@@ -2283,6 +2283,13 @@ nixlLibfabricEngine::addReceivedXferId(uint16_t xfer_id, uint32_t sender_peer_id
         NIXL_DEBUG << "Incremented received count for sender_peer_idx=" << sender_peer_idx
                    << " notif_xfer_id=" << xfer_id << ": " << it->second.received_completions << "/"
                    << it->second.expected_completions;
+
+        // Most writes of a transfer cannot complete its notification. Skip the second lock
+        // and lookup in checkPendingNotification() unless this write might.
+        if (it->second.received_completions < it->second.expected_completions ||
+            it->second.received_msg_fragments < it->second.expected_msg_fragments) {
+            return;
+        }
     }
 
     // Check whether this notification can now be completed (after releasing the lock)
