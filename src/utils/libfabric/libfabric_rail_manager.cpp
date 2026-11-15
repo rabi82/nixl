@@ -1420,6 +1420,15 @@ thread_local std::vector<PostStage> tl_post_stages;
 
 inline void
 stagePost(nixlLibfabricRail *rail, const nixlLibfabricPostRequest &pr) {
+    // NIXL_LIBFABRIC_POST_STAGE=0 pushes every post straight to the ring (debug switch).
+    static const bool use_stage = [] {
+        const char *e = std::getenv("NIXL_LIBFABRIC_POST_STAGE");
+        return !(e && e[0] == '0');
+    }();
+    if (!use_stage) {
+        rail->enqueuePost(pr);
+        return;
+    }
     PostStage *stage = nullptr;
     for (auto &s : tl_post_stages) {
         if (s.rail == rail) {

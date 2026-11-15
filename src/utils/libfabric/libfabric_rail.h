@@ -29,6 +29,7 @@
 #include <thread>
 #include <ostream>
 #include <stack>
+#include <cstdlib>
 
 #include "nixl.h"
 #include "backend/backend_aux.h"
@@ -368,7 +369,12 @@ public:
         size_t absTail = tail_.load(std::memory_order_relaxed);
         // Consumer-side copy of head: re-read the shared counter only when the cached
         // window is used up, so producers keep that cache line most of the time.
-        if (absTail == cached_head_) {
+        // NIXL_LIBFABRIC_RING_HEAD_CACHE=0 re-reads head_ on every pop (debug switch).
+        static const bool use_head_cache = [] {
+            const char *e = std::getenv("NIXL_LIBFABRIC_RING_HEAD_CACHE");
+            return !(e && e[0] == '0');
+        }();
+        if (!use_head_cache || absTail == cached_head_) {
             cached_head_ = head_.load(std::memory_order_acquire);
             if (absTail == cached_head_) {
                 return false;
