@@ -124,6 +124,19 @@ public:
     static void
     flushDeferredPosts();
 
+    /** Group READ descriptors per rail and post them with FI_MORE, as for WRITE. */
+    void
+    setBatchReads(bool batch_reads) {
+        batch_reads_ = batch_reads;
+    }
+
+    /** True when @p op_type is posted in per-rail FI_MORE groups. */
+    bool
+    batchesOp(nixlLibfabricReq::OpType op_type) const {
+        return op_type == nixlLibfabricReq::WRITE ||
+            (batch_reads_ && op_type == nixlLibfabricReq::READ);
+    }
+
     /** Update the size at or above which a transfer is striped across rails. */
     void
     setStripingThreshold(size_t striping_threshold) {
@@ -463,6 +476,7 @@ private:
     static constexpr size_t kMaxDedicatedRails = 64;
     std::array<std::atomic<bool>, kMaxDedicatedRails> rail_dedicated_{};
     std::atomic<uint64_t> active_rail_gen_{0};
+    bool batch_reads_ = true;
     mutable std::mutex active_rails_mutex_;
 
     // rail selection policy for DRAM memory type

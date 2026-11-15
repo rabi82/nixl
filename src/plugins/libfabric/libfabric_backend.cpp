@@ -558,6 +558,12 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
     // The rail manager is built before params are parsed; apply the parsed value to it.
     rail_manager_.setStripingThreshold(striping_threshold_);
 
+    // READ descriptors are grouped per rail and posted with FI_MORE like WRITE.
+    // Disable with NIXL_LIBFABRIC_READ_FI_MORE=0.
+    size_t read_fi_more = 1;
+    LibfabricUtils::getCustomIntParam(getCustomParams(), "read_fi_more", read_fi_more);
+    rail_manager_.setBatchReads(read_fi_more != 0);
+
     initPostThreadPool();
     // Initialize Rail Manager which will discover the topology and create all rails.
     try {
@@ -1415,7 +1421,7 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
     // last post flushed, or its batch would never be submitted.
     // allow_fi_more is false on the thread-pool path: chunks on other threads can interleave
     // posts on the same rail, so a per-chunk walk cannot know a rail's true last post there.
-    const bool batch_writes = allow_fi_more && op_type == nixlLibfabricReq::WRITE;
+    const bool batch_writes = allow_fi_more && rail_manager_.batchesOp(op_type);
 
     std::vector<int> last_desc_idx_per_rail(rail_manager_.getNumRails(), -1);
     std::vector<int> posts_since_flush(rail_manager_.getNumRails(), 0);

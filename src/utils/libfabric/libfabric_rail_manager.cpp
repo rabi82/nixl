@@ -447,7 +447,9 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
         // for FI_MORE batching. READ: per-descriptor round-robin (FI_MORE has no benefit).
         // apply_fi_more is precomputed by the caller, which leaves it false for the last post
         // on each rail so that every rail's FI_MORE batch is flushed.
-        const bool batch_write = (op_type == nixlLibfabricReq::WRITE);
+        // WRITE (and READ unless disabled): group consecutive descriptors on one rail so
+        // they can share a doorbell via FI_MORE.
+        const bool batch_write = batchesOp(op_type);
         const size_t rail_sel_idx =
             railSelectionIndex(base_offset, desc_idx, batch_write, selected_rails.size());
         const size_t rail_id = selected_rails[rail_sel_idx];
