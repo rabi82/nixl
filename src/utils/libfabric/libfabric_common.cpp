@@ -198,24 +198,10 @@ getNextXferId() {
 
 uint8_t
 getNextSeqId() {
-    uint8_t seq_id = g_seq_id_counter.fetch_add(1);
-
-    // Handle wraparound: 4-bit field can hold 0 to 15
-    if (seq_id > NIXL_SEQ_ID_MASK) {
-        // Reset counter atomically and get a fresh ID
-        uint8_t expected = seq_id;
-        while (expected > NIXL_SEQ_ID_MASK &&
-               !g_seq_id_counter.compare_exchange_weak(expected, 0)) {
-            expected = g_seq_id_counter.load();
-        }
-        seq_id = g_seq_id_counter.fetch_add(1);
-        // Ensure we don't exceed the mask after reset
-        if (seq_id > NIXL_SEQ_ID_MASK) {
-            seq_id = 0;
-        }
-    }
-
-    return seq_id;
+    // The sequence id only fills a 4-bit field of the immediate data and is never decoded.
+    // A per-thread counter avoids a shared atomic RMW on every posted write.
+    static thread_local uint8_t tl_seq_id = 0;
+    return tl_seq_id++ & NIXL_SEQ_ID_MASK;
 }
 
 void

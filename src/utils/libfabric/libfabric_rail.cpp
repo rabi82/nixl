@@ -79,6 +79,7 @@ RequestPool::initializeBasePool(size_t pool_size) {
         requests_[i].in_use = false;
         free_indices_.push(i);
     }
+    pool_size_.store(requests_.size(), std::memory_order_release);
 
     NIXL_DEBUG << "InitializeBasePool - Rail " << rail_id_
                << " completed. Total requests: " << requests_.size()
@@ -141,8 +142,6 @@ RequestPool::release(nixlLibfabricReq *req) const {
         return;
     }
 
-    std::lock_guard<nixlLibfabricSpinLock> lock(pool_mutex_);
-
     // GUARD: Check if already released
     if (!req->in_use) {
         NIXL_WARN << "Attempt to double-release request XFER_ID=" << req->xfer_id << " on rail "
@@ -166,13 +165,14 @@ RequestPool::release(nixlLibfabricReq *req) const {
     size_t idx = req->pool_index;
 
     // Validate the index is within bounds
-    if (idx >= requests_.size()) {
+    if (idx >= pool_size_.load(std::memory_order_acquire)) {
         NIXL_ERROR << "Release Req on Rail " << rail_id_ << " invalid pool index " << idx
-                   << " for request release (pool size=" << requests_.size() << ")";
+                   << " for request release";
         return;
     }
 
-    free_indices_.push(idx);
+    std::lock_guard<nixlLibfabricSpinLock> lock(release_mutex_);
+    released_indices_.push(idx);
 }
 
 nixlLibfabricReq *
@@ -194,18 +194,27 @@ RequestPool::findByContext(void *context) const {
 size_t
 RequestPool::getActiveRequestCount() const {
     std::lock_guard<nixlLibfabricSpinLock> lock(pool_mutex_);
-    return requests_.size() - free_indices_.size();
+    std::lock_guard<nixlLibfabricSpinLock> rlock(release_mutex_);
+    return requests_.size() - free_indices_.size() - released_indices_.size();
 }
 
 size_t
 RequestPool::getPoolUtilization() const {
     std::lock_guard<nixlLibfabricSpinLock> lock(pool_mutex_);
-    return ((requests_.size() - free_indices_.size()) * 100) / requests_.size();
+    std::lock_guard<nixlLibfabricSpinLock> rlock(release_mutex_);
+    return ((requests_.size() - free_indices_.size() - released_indices_.size()) * 100) /
+        requests_.size();
 }
 
 nixlLibfabricReq *
 RequestPool::allocateReq(uint32_t req_id) {
     std::lock_guard<nixlLibfabricSpinLock> lock(pool_mutex_);
+
+    if (free_indices_.empty()) {
+        // Take everything released since the last refill in one swap.
+        std::lock_guard<nixlLibfabricSpinLock> rlock(release_mutex_);
+        free_indices_.swap(released_indices_);
+    }
 
     if (free_indices_.empty()) {
         size_t old_size = requests_.size();
@@ -883,7 +892,7 @@ nixlLibfabricRail::progressCompletionQueue() {
 
     // Only protect libfabric CQ hardware operations
     {
-        std::lock_guard<std::mutex> ep_lock(ep_mutex_);
+        std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
 
         // Non-blocking read (used by progress thread or fallback)
         ret = fi_cq_readfrom(cq, completions, NIXL_LIBFABRIC_CQ_BATCH_SIZE, src_addrs);
@@ -967,7 +976,7 @@ nixlLibfabricRail::pollForCompletions() {
     struct fi_cq_err_entry err_entry = {};
     int cq_ret;
     {
-        const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
+        const std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
         cq_ret = fi_cq_readfrom(cq, cq_buf, NIXL_LIBFABRIC_CQ_BATCH_SIZE, src_addrs);
         if (cq_ret < 0 && cq_ret != -FI_EAGAIN) {
             fi_cq_readerr(cq, &err_entry, 0);
@@ -1265,7 +1274,7 @@ nixlLibfabricRail::postRecv(nixlLibfabricReq *req) const {
 
     int ret;
     {
-        const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
+        const std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
         ret = fi_recvmsg(endpoint, &msg, 0);
     }
     if (ret) {
@@ -1301,7 +1310,7 @@ nixlLibfabricRail::postSend(uint64_t immediate_data, fi_addr_t dest_addr, nixlLi
     while (true) {
         // Libfabric fi_senddata call
         {
-            const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
+            const std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
             ret = fi_senddata(endpoint,
                               req->buffer,
                               req->buffer_size,
@@ -1456,7 +1465,7 @@ nixlLibfabricRail::drainPostQueue() {
                 msg.context = &pr.req->ctx;
                 msg.data = pr.immediate_data;
 
-                const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
+                const std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
                 ret = fi_writemsg(endpoint, &msg, pr.fi_flags | FI_REMOTE_CQ_DATA);
             } else {
                 struct iovec iov{};
@@ -1478,7 +1487,7 @@ nixlLibfabricRail::drainPostQueue() {
                 msg.rma_iov_count = 1;
                 msg.context = &pr.req->ctx;
 
-                const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
+                const std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
                 ret = fi_readmsg(endpoint, &msg, pr.fi_flags);
             }
 
@@ -1558,7 +1567,7 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
     while (true) {
         // Libfabric fi_writemsg call (supports FI_MORE flag)
         {
-            const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
+            const std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
             ret = fi_writemsg(endpoint, &msg, fi_flags | FI_REMOTE_CQ_DATA);
         }
 
@@ -1634,7 +1643,7 @@ nixlLibfabricRail::postRead(void *local_buffer,
     while (true) {
         // Libfabric fi_read call
         {
-            const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
+            const std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
             ret = fi_read(endpoint,
                           local_buffer,
                           length,
@@ -1887,7 +1896,7 @@ nixlLibfabricRail::registerMemory(void *buffer,
 
     // Only an MR bound to the endpoint (FI_MR_ENDPOINT) needs the lock.
     if (info->domain_attr->mr_mode & FI_MR_ENDPOINT) {
-        const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
+        const std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
         ret = fi_mr_bind(mr, &endpoint->fid, 0);
         if (ret) {
             NIXL_ERROR << "fi_mr_bind failed on rail " << rail_id << ": " << fi_strerror(-ret);
@@ -1930,7 +1939,7 @@ nixlLibfabricRail::deregisterMemory(struct fid_mr *mr) const {
     }
 
     // Same rule as registerMemory: only an MR bound to the endpoint needs the EP lock.
-    std::unique_lock<std::mutex> ep_lock(ep_mutex_, std::defer_lock);
+    std::unique_lock<nixlLibfabricSpinLock> ep_lock(ep_mutex_, std::defer_lock);
     if (info->domain_attr->mr_mode & FI_MR_ENDPOINT) {
         ep_lock.lock();
     }
@@ -1960,7 +1969,7 @@ nixlLibfabricRail::insertAddress(const void *addr,
 
     int ret;
     {
-        const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
+        const std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
         ret = fi_av_insert(av, addr, 1, fi_addr_out, 0, NULL);
     }
     if (ret != 1) {
@@ -1987,7 +1996,7 @@ nixlLibfabricRail::removeAddress(fi_addr_t fi_addr) const {
 
     int ret;
     {
-        const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
+        const std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
         ret = fi_av_remove(av, &fi_addr, 1, 0);
     }
     if (ret != 0) {

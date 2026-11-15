@@ -133,10 +133,16 @@ protected:
     initializeBasePool(size_t pool_size);
 
     mutable std::deque<nixlLibfabricReq> requests_; ///< Expandable request pool
-    mutable std::stack<size_t> free_indices_; ///< Stack of available request indices
+    mutable std::stack<size_t> free_indices_; ///< Indices ready to allocate (pool_mutex_)
+    /** Indices released since the last refill (release_mutex_). The allocator swaps this into
+     * free_indices_ when it runs dry, so the allocating thread and the completing thread do
+     * not share a lock on every request. */
+    mutable std::stack<size_t> released_indices_;
+    mutable std::atomic<size_t> pool_size_{0}; ///< requests_.size(), readable without a lock
     size_t rail_id_; ///< Rail ID for this pool
     size_t initial_pool_size_; ///< Original pool size for expansion calculations
-    mutable nixlLibfabricSpinLock pool_mutex_; ///< Thread safety protection (short sections)
+    mutable nixlLibfabricSpinLock pool_mutex_; ///< Guards free_indices_ and pool growth
+    mutable nixlLibfabricSpinLock release_mutex_; ///< Guards released_indices_
 };
 
 /** Buffer chunk structure for control request pool */
@@ -616,7 +622,7 @@ private:
     //    the thread that reaps completions (and so clears EAGAIN) needs the lock too.
     //  - Keep it innermost: never run completion handling or callbacks while holding it,
     //    they take other locks and may re-enter (e.g. postRecv from a recv completion).
-    mutable std::mutex ep_mutex_;
+    mutable nixlLibfabricSpinLock ep_mutex_; ///< Short sections around EP/CQ calls
 
     // Lock-free MPSC ring: main thread pushes, PT pops and posts
     using post_ring_t = MpscRing<nixlLibfabricPostRequest>;
