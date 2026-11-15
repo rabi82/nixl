@@ -1171,7 +1171,9 @@ nixlLibfabricRailManager::progressActiveRails() {
         // Always progress rail 0 for notifications (SEND/RECV)
         rails_to_process.push_back(0);
         for (const auto &[rail_id, refcount] : active_rails_) {
-            if (rail_id != 0) {
+            if (rail_id != 0 &&
+                !(rail_id < kMaxDedicatedRails &&
+                  rail_dedicated_[rail_id].load(std::memory_order_acquire))) {
                 rails_to_process.push_back(rail_id);
             }
         }
@@ -1459,30 +1461,63 @@ nixlLibfabricRailManager::bindThreadToActiveRailNuma() {
     if (rail_id == SIZE_MAX) {
         return false; // nothing registered yet, retry later
     }
-    if (!topology || numa_available() < 0) {
-        return true;
+    bindThreadToRailNuma(rail_id);
+    return true;
+}
+
+void
+nixlLibfabricRailManager::getActiveDataRails(std::vector<size_t> &rail_ids) const {
+    rail_ids.clear();
+    std::lock_guard<std::mutex> lock(active_rails_mutex_);
+    for (const auto &[id, refcount] : active_rails_) {
+        if (refcount > 0 && id != 0 && id < rails_.size()) {
+            rail_ids.push_back(id);
+        }
+    }
+}
+
+void
+nixlLibfabricRailManager::setRailDedicated(size_t rail_id) {
+    if (rail_id == 0 || rail_id >= kMaxDedicatedRails) {
+        return;
+    }
+    rail_dedicated_[rail_id].store(true, std::memory_order_release);
+}
+
+nixl_status_t
+nixlLibfabricRailManager::progressRail(size_t rail_id) {
+    if (rail_id >= rails_.size()) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    return rails_[rail_id]->progressCompletionQueue();
+}
+
+void
+nixlLibfabricRailManager::bindThreadToRailNuma(size_t rail_id) {
+    if (rail_id >= rails_.size() || !topology || numa_available() < 0) {
+        return;
     }
 
     const uint16_t node = topology->getDeviceNumaNode(rails_[rail_id]->device_name);
     if (node == nixlLibfabricTopology::INVALID_NUMA_NODE_ID) {
         NIXL_DEBUG << "PT NUMA bind: no NUMA node for " << rails_[rail_id]->device_name;
-        return true;
+        return;
     }
 
     struct bitmask *node_cpus = numa_allocate_cpumask();
     if (!node_cpus) {
-        return true;
+        return;
     }
     if (numa_node_to_cpus(node, node_cpus) != 0) {
         numa_free_cpumask(node_cpus);
-        return true;
+        return;
     }
 
     cpu_set_t current;
     CPU_ZERO(&current);
     if (pthread_getaffinity_np(pthread_self(), sizeof(current), &current) != 0) {
         numa_free_cpumask(node_cpus);
-        return true;
+        return;
     }
 
     // Only narrow the existing affinity: never move the thread to CPUs it was not allowed on.
@@ -1500,15 +1535,15 @@ nixlLibfabricRailManager::bindThreadToActiveRailNuma() {
     if (count == 0) {
         NIXL_INFO << "PT NUMA bind: thread affinity has no CPU on NUMA node " << node
                   << " of rail " << rails_[rail_id]->device_name << "; keeping current affinity";
-        return true;
+        return;
     }
     if (pthread_setaffinity_np(pthread_self(), sizeof(wanted), &wanted) != 0) {
         NIXL_WARN << "PT NUMA bind: pthread_setaffinity_np failed for NUMA node " << node;
-        return true;
+        return;
     }
     NIXL_INFO << "Progress thread bound to " << count << " CPUs of NUMA node " << node
               << " (rail " << rails_[rail_id]->device_name << ")";
-    return true;
+    return;
 }
 
 void
@@ -1520,6 +1555,7 @@ nixlLibfabricRailManager::incRailActive(size_t rail_id) {
 
     std::lock_guard<std::mutex> lock(active_rails_mutex_);
     active_rails_[rail_id]++;
+    active_rail_gen_.fetch_add(1, std::memory_order_release);
     NIXL_DEBUG << "incRailActive rail " << rail_id << " (refcount: " << active_rails_[rail_id]
                << ", total active: " << active_rails_.size() << ")";
 }

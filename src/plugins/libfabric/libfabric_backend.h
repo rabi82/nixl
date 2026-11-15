@@ -230,6 +230,8 @@ private:
 
     // Progress thread for rail CQs
     std::thread progress_thread_;
+    /** Dedicated per-rail progress threads (NIXL_LIBFABRIC_PT_PER_RAIL=1). */
+    std::vector<std::thread> rail_progress_threads_;
     std::atomic<bool> progress_thread_stop_;
 
     // Mutex for connection state tracking
@@ -344,6 +346,10 @@ private:
     // Progress thread for rail CQs
     nixl_status_t
     progressThread();
+
+    /** Progress loop of a dedicated per-rail thread. */
+    void
+    railProgressThread(size_t rail_id);
 
 
     // Engine message processing methods.

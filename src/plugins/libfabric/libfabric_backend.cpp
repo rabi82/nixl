@@ -695,6 +695,13 @@ nixlLibfabricEngine::~nixlLibfabricEngine() {
     if (progress_thread_enabled_ && progress_thread_.joinable()) {
         NIXL_DEBUG << "Waiting for Progress thread to exit";
         progress_thread_.join();
+        // The main PT starts the per-rail threads, so join them after it.
+        for (auto &t : rail_progress_threads_) {
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+        rail_progress_threads_.clear();
         NIXL_DEBUG << "Progress thread joined successfully";
     } else if (!progress_thread_enabled_) {
         NIXL_DEBUG << "Progress thread was not running";
@@ -2118,8 +2125,34 @@ nixlLibfabricEngine::progressThread() {
     size_t pt_numa_bind = 1;
     LibfabricUtils::getCustomIntParam(getCustomParams(), "pt_numa_bind", pt_numa_bind);
     bool numa_bind_done = (pt_numa_bind == 0);
+    // Optional: one dedicated progress thread per data rail. This thread keeps rail 0
+    // (control/notifications) and any rail not handed off. Off by default.
+    size_t pt_per_rail = 0;
+    LibfabricUtils::getCustomIntParam(getCustomParams(), "pt_per_rail", pt_per_rail);
+    uint64_t seen_rail_gen = 0;
+    std::vector<size_t> active_data_rails;
+    std::vector<bool> rail_has_thread(rail_manager_.getNumRails(), false);
     // Main progress loop - continuously process completions only on rails
     while (!progress_thread_stop_.load()) {
+        if (pt_per_rail) {
+            const uint64_t gen = rail_manager_.activeRailGeneration();
+            if (gen != seen_rail_gen) {
+                seen_rail_gen = gen;
+                rail_manager_.getActiveDataRails(active_data_rails);
+                for (size_t rail_id : active_data_rails) {
+                    if (rail_id < rail_has_thread.size() && !rail_has_thread[rail_id]) {
+                        rail_has_thread[rail_id] = true;
+                        // Hand off before the thread starts: this loop is the only other
+                        // poller of the rail, and it is not inside progressActiveRails() now.
+                        rail_manager_.setRailDedicated(rail_id);
+                        rail_progress_threads_.emplace_back(
+                            &nixlLibfabricEngine::railProgressThread, this, rail_id);
+                        NIXL_INFO << "PT: started dedicated progress thread for rail "
+                                  << rail_id;
+                    }
+                }
+            }
+        }
         if (!numa_bind_done) {
             numa_bind_done = rail_manager_.bindThreadToActiveRailNuma();
         }
@@ -2139,6 +2172,23 @@ nixlLibfabricEngine::progressThread() {
     }
     NIXL_DEBUG << "PT: Thread exiting cleanly";
     return NIXL_SUCCESS;
+}
+
+void
+nixlLibfabricEngine::railProgressThread(size_t rail_id) {
+    size_t pt_numa_bind = 1;
+    LibfabricUtils::getCustomIntParam(getCustomParams(), "pt_numa_bind", pt_numa_bind);
+    if (pt_numa_bind) {
+        rail_manager_.bindThreadToRailNuma(rail_id);
+    }
+    while (!progress_thread_stop_.load(std::memory_order_relaxed)) {
+        const nixl_status_t status = rail_manager_.progressRail(rail_id);
+        if (status == NIXL_IN_PROG) {
+            std::this_thread::sleep_for(progress_thread_delay_);
+        } else if (status != NIXL_SUCCESS) {
+            NIXL_ERROR << "PT: failed to progress rail " << rail_id;
+        }
+    }
 }
 
 /****************************************

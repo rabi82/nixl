@@ -19,6 +19,8 @@
 #define NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_RAIL_MANAGER_H
 
 #include <vector>
+#include <array>
+#include <atomic>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -89,6 +91,31 @@ public:
      */
     bool
     bindThreadToActiveRailNuma();
+
+    /** Restrict the calling thread to the CPUs of the NUMA node of rail @p rail_id. */
+    void
+    bindThreadToRailNuma(size_t rail_id);
+
+    /** Ids of rails that currently have registered memory (excluding rail 0). */
+    void
+    getActiveDataRails(std::vector<size_t> &rail_ids) const;
+
+    /** Bumped whenever a rail becomes active; lets a poller notice new rails cheaply. */
+    uint64_t
+    activeRailGeneration() const {
+        return active_rail_gen_.load(std::memory_order_acquire);
+    }
+
+    /**
+     * Hand rail @p rail_id to a dedicated progress thread: progressActiveRails() stops
+     * touching it. Rail 0 (control traffic) can not be handed off.
+     */
+    void
+    setRailDedicated(size_t rail_id);
+
+    /** Progress one rail's CQ and post queue. Caller must be the rail's only progress thread. */
+    nixl_status_t
+    progressRail(size_t rail_id);
 
     /**
      * @brief Hand all post requests this thread staged by deferTransferRequest() to the
@@ -433,6 +460,9 @@ private:
 
     // active rails with reference counting (always positive)
     std::unordered_map<size_t, size_t> active_rails_;
+    static constexpr size_t kMaxDedicatedRails = 64;
+    std::array<std::atomic<bool>, kMaxDedicatedRails> rail_dedicated_{};
+    std::atomic<uint64_t> active_rail_gen_{0};
     mutable std::mutex active_rails_mutex_;
 
     // rail selection policy for DRAM memory type
